@@ -1,6 +1,7 @@
 /target/
 /dist/
 /docs/
+/AGENTS.md
 .DS_Store
 Thumbs.db
 *.pdb
