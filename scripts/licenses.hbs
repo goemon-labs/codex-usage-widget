@@ -1,0 +1,22 @@
+# サードパーティライセンス
+
+このアプリと使用ライブラリの著作権表示・ライセンスをまとめています。
+日本語フォントについては、[素材のライセンス](assets/NOTICE.md)と[フォントのライセンス全文](assets/FONT-LICENSE.txt)を参照してください。
+
+{{#each licenses}}
+## {{name}}
+
+対象：
+{{#each used_by}}
+{{#if (eq crate.name "codex-usage-widget")}}
+- [{{crate.name}} {{crate.version}} ソースコード](https://github.com/goemon-labs/codex-usage-widget)
+{{else}}
+- [{{crate.name}} {{crate.version}} source](https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download)
+{{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

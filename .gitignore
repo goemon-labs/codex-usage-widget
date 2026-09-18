@@ -1,0 +1,20 @@
+/target/
+/dist/
+/docs/
+.DS_Store
+Thumbs.db
+*.pdb
+__pycache__/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+.codex/
+auth.json
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx

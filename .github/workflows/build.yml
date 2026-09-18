@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      RUSTUP_TOOLCHAIN: '1.98.1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target ${{ matrix.target }}
+      - name: Check formatting
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 fmt --check
+      - name: Check code
+        run: cargo +1.98.1 clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Test quota and protocol handling
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test --locked
+      - name: Build and package Windows app
+        if: runner.os == 'Windows'
+        run: python scripts/package.py --target ${{ matrix.target }} --build --installer
+      - name: Build and package Mac app
+        if: runner.os == 'macOS'
+        run: python scripts/package.py --target ${{ matrix.target }} --build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: codex-usage-widget-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+            dist/*.sha256
+          if-no-files-found: error
