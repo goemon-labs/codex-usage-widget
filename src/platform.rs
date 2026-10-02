@@ -1,4 +1,6 @@
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
+#[cfg(windows)]
+pub mod topmost;
 use eframe::egui;
 use std::sync::mpsc::Sender;
 use tray_icon::{

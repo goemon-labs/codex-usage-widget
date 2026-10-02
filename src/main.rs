@@ -106,6 +106,10 @@ fn main() -> eframe::Result {
             platform::configure_window(cc);
             platform::keep_window_visible(cc);
             let mut widget = app::Widget::new(&cc.egui_ctx, settings);
+            #[cfg(windows)]
+            if let Some(window) = cc.winit_window() {
+                widget.attach_window(window);
+            }
             widget.attach_instance(&cc.egui_ctx, instance)?;
             Ok(Box::new(widget))
         }),

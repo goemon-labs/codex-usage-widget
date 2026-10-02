@@ -56,6 +56,8 @@ struct BarMenu {
 
 pub struct Widget {
     settings: Settings,
+    #[cfg(windows)]
+    topmost: Option<platform::topmost::Topmost>,
     instance: Option<crate::instance::Instance>,
     installation: Option<codex::Installation>,
     usage: Option<Usage>,
@@ -123,6 +125,8 @@ impl Widget {
         let size = window_size(settings.bar_mode);
         Self {
             settings,
+            #[cfg(windows)]
+            topmost: None,
             instance: None,
             installation: None,
             usage: None,
@@ -164,6 +168,11 @@ impl Widget {
         })?;
         self.instance = Some(instance);
         Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn attach_window(&mut self, window: &winit::window::Window) {
+        self.topmost = platform::topmost::Topmost::new(window, self.settings.always_on_top);
     }
 
     fn refresh(&mut self, ctx: &egui::Context, changed_configuration: bool) {
@@ -299,6 +308,10 @@ impl Widget {
     }
 
     fn update_topmost(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if let Some(topmost) = &self.topmost {
+            topmost.set_enabled(self.settings.always_on_top);
+        }
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
             if self.settings.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
