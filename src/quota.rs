@@ -2,24 +2,73 @@ use chrono::{DateTime, Local};
 use serde::Deserialize;
 use serde_json::Value;
 
-const WEEK_MINUTES: u64 = 7 * 24 * 60;
+const HOUR: u64 = 60;
+const DAY: u64 = 24 * HOUR;
+pub const FIVE_HOURS: u64 = 5 * HOUR;
+pub const WEEK: u64 = 7 * DAY;
+const MONTH: u64 = 30 * DAY;
+const YEAR: u64 = 365 * DAY;
+
+/// The length of a usage window as reported by a service.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Span {
+    Minutes(u64),
+    Unknown,
+}
+
+impl Span {
+    // Reported lengths can drift slightly; Codex treats lengths within 5% as the same window.
+    fn near(self, nominal: u64) -> bool {
+        matches!(self, Self::Minutes(minutes)
+            if minutes as f64 >= nominal as f64 * 0.95 && minutes as f64 <= nominal as f64 * 1.05)
+    }
+
+    pub fn is_weekly(self) -> bool {
+        self.near(WEEK)
+    }
+
+    pub fn minutes(self) -> Option<u64> {
+        match self {
+            Self::Minutes(minutes) => Some(minutes),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn label(self) -> String {
+        let Self::Minutes(minutes) = self else {
+            return "利用枠".into();
+        };
+        for (nominal, label) in [
+            (FIVE_HOURS, "5時間"),
+            (DAY, "日次"),
+            (WEEK, "週次"),
+            (MONTH, "月次"),
+            (YEAR, "年次"),
+        ] {
+            if self.near(nominal) {
+                return label.into();
+            }
+        }
+        if minutes.is_multiple_of(DAY) {
+            format!("{}日", minutes / DAY)
+        } else if minutes.is_multiple_of(HOUR) {
+            format!("{}時間", minutes / HOUR)
+        } else {
+            format!("{minutes}分")
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Window {
-    pub minutes: u64,
+    pub span: Span,
     pub remaining: Option<f64>,
     pub resets_at: Option<i64>,
 }
 
 impl Window {
     pub fn label(&self) -> String {
-        if self.minutes == WEEK_MINUTES {
-            "週次".into()
-        } else if self.minutes.is_multiple_of(60) {
-            format!("{}時間", self.minutes / 60)
-        } else {
-            format!("{}分", self.minutes)
-        }
+        self.span.label()
     }
 
     pub fn remaining_label(&self) -> String {
@@ -33,14 +82,120 @@ impl Window {
     pub fn expired(&self, now: i64) -> bool {
         self.resets_at.is_some_and(|reset| reset <= now)
     }
+
+    /// Used up and not yet reset.
+    pub fn exhausted(&self, now: i64) -> bool {
+        self.remaining.is_some_and(|value| value <= 0.0) && !self.expired(now)
+    }
+}
+
+/// Windows that limit the same usage, such as one model family.
+#[derive(Clone, Debug, Default)]
+pub struct Group {
+    /// Distinguishes groups when a service reports more than one.
+    pub name: Option<String>,
+    /// Ordered from the shortest window to the longest.
+    pub windows: Vec<Window>,
+}
+
+impl Group {
+    pub fn new(name: Option<String>, mut windows: Vec<Window>) -> Self {
+        windows.sort_by_key(|window| window.span.minutes().unwrap_or(u64::MAX));
+        Self { name, windows }
+    }
+
+    /// The window label, prefixed with the group name when there is one.
+    pub fn window_label(&self, window: &Window) -> String {
+        match &self.name {
+            Some(name) => format!("{name}・{}", window.label()),
+            None => window.label(),
+        }
+    }
+
+    fn exhaustion(&self, now: i64) -> Option<Blocked> {
+        // Every exhausted window has to reset before the group can be used again.
+        let window = self
+            .windows
+            .iter()
+            .filter(|window| window.exhausted(now))
+            .max_by_key(|window| window.resets_at.unwrap_or(i64::MAX))?;
+        Some(Blocked {
+            label: format!("{}の枠", self.window_label(window)),
+            until: window.resets_at,
+            minutes: window.span.minutes(),
+        })
+    }
+}
+
+/// Usage stops only when every group is used up; it resumes when the first group recovers.
+pub fn blocked(groups: &[Group], now: i64) -> Option<Blocked> {
+    groups
+        .iter()
+        .map(|group| group.exhaustion(now))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min_by_key(|blocked| blocked.until.unwrap_or(i64::MAX))
+}
+
+/// A spending limit, such as a monthly credit allowance.
+#[derive(Clone, Debug)]
+pub struct Cap {
+    pub label: String,
+    pub remaining: Option<f64>,
+    /// Amounts already formatted with their unit.
+    pub detail: Option<String>,
+    pub resets_at: Option<i64>,
+}
+
+/// The service has stopped ordinary usage until a limit recovers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Blocked {
+    /// What ran out, such as "5時間の枠".
+    pub label: String,
+    pub until: Option<i64>,
+    /// Length of the exhausted window, for showing progress toward recovery.
+    pub minutes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
-pub struct Usage {
-    pub weekly: Option<Window>,
-    pub short: Option<Window>,
+pub struct Snapshot {
+    /// The first group holds the service's main limits and may be empty.
+    pub groups: Vec<Group>,
+    pub cap: Option<Cap>,
+    /// Remaining prepaid credits, already formatted.
+    pub balance: Option<String>,
     pub reset_credits: Option<ResetCredits>,
-    pub fetched_at: DateTime<Local>,
+    pub blocked: Option<Blocked>,
+    pub observed_at: DateTime<Local>,
+}
+
+impl Snapshot {
+    /// The window shown in large type: the main weekly window, otherwise the longest one.
+    pub fn main_window(&self) -> Option<&Window> {
+        let windows = &self.groups.first()?.windows;
+        windows
+            .iter()
+            .find(|window| window.span.is_weekly())
+            .or_else(|| windows.last())
+    }
+
+    pub fn next_reset(&self, now: i64) -> Option<i64> {
+        self.groups
+            .iter()
+            .flat_map(|group| &group.windows)
+            .filter_map(|window| window.resets_at)
+            .chain(self.cap.iter().filter_map(|cap| cap.resets_at))
+            .chain(self.blocked.iter().filter_map(|blocked| blocked.until))
+            .chain(
+                self.reset_credits
+                    .iter()
+                    .filter_map(|resets| resets.credits.as_ref())
+                    .flatten()
+                    .filter_map(|credit| credit.expires_at),
+            )
+            .filter(|reset| *reset > now)
+            .min()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +220,7 @@ struct RawResetCredits {
 }
 
 impl ResetCredits {
-    fn from_response(value: &Value) -> Option<Self> {
+    pub fn from_response(value: &Value) -> Option<Self> {
         let raw: RawResetCredits = serde_json::from_value(value.clone()).ok()?;
         let credits = raw.credits.map(|mut credits| {
             credits.retain(|credit| {
@@ -87,90 +242,120 @@ impl ResetCredits {
     }
 }
 
-impl Usage {
-    pub fn from_response(value: Value) -> Result<Self, &'static str> {
-        let bucket =
-            if let Some(buckets) = value.get("rateLimitsByLimitId").filter(|v| !v.is_null()) {
-                buckets
-                    .get("codex")
-                    .ok_or("Codexの利用枠を確認できませんでした")?
-            } else {
-                value
-                    .get("rateLimits")
-                    .ok_or("利用枠の応答を確認できませんでした")?
-            };
-        let bucket: RawBucket = serde_json::from_value(bucket.clone())
-            .map_err(|_| "利用枠の形式を確認できませんでした")?;
-        if bucket.limit_id.as_deref().is_some_and(|id| id != "codex") {
-            return Err("Codexの利用枠を確認できませんでした");
-        }
-        let mut windows: Vec<Window> = [bucket.primary, bucket.secondary]
-            .into_iter()
-            .flatten()
-            .filter_map(RawWindow::normalize)
-            .collect();
-        windows.sort_by_key(|window| window.minutes);
-        Ok(Self {
-            weekly: windows.iter().find(|w| w.minutes == WEEK_MINUTES).cloned(),
-            short: windows.into_iter().find(|w| w.minutes < WEEK_MINUTES),
-            reset_credits: value
-                .get("rateLimitResetCredits")
-                .and_then(ResetCredits::from_response),
-            fetched_at: Local::now(),
-        })
-    }
-
-    pub fn next_reset(&self, now: i64) -> Option<i64> {
-        [&self.weekly, &self.short]
-            .into_iter()
-            .flatten()
-            .filter_map(|window| window.resets_at)
-            .chain(
-                self.reset_credits
-                    .iter()
-                    .filter_map(|resets| resets.credits.as_ref())
-                    .flatten()
-                    .filter_map(|credit| credit.expires_at),
-            )
-            .filter(|reset| *reset > now)
-            .min()
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawBucket {
-    limit_id: Option<String>,
-    primary: Option<RawWindow>,
-    secondary: Option<RawWindow>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawWindow {
-    used_percent: Option<f64>,
-    window_duration_mins: Option<u64>,
-    resets_at: Option<i64>,
-}
-
-impl RawWindow {
-    fn normalize(self) -> Option<Window> {
-        let minutes = self.window_duration_mins.filter(|value| *value > 0)?;
-        Some(Window {
-            minutes,
-            remaining: self
-                .used_percent
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(|used| (100.0 - used).clamp(0.0, 100.0)),
-            resets_at: self.resets_at.filter(|value| *value > 0),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn window(minutes: u64, remaining: Option<f64>, resets_at: Option<i64>) -> Window {
+        Window {
+            span: Span::Minutes(minutes),
+            remaining,
+            resets_at,
+        }
+    }
+
+    #[test]
+    fn spans_share_labels_with_nearby_lengths() {
+        for (minutes, label) in [
+            (300, "5時間"),
+            (290, "5時間"),
+            (1440, "日次"),
+            (10080, "週次"),
+            (10079, "週次"),
+            (43200, "月次"),
+            (180, "3時間"),
+            (2880, "2日"),
+            (45, "45分"),
+        ] {
+            assert_eq!(Span::Minutes(minutes).label(), label, "{minutes}");
+        }
+        assert!(Span::Minutes(10500).is_weekly());
+        assert!(!Span::Minutes(43200).is_weekly());
+        assert_eq!(Span::Unknown.label(), "利用枠");
+    }
+
+    #[test]
+    fn rounding_does_not_invent_remaining_quota() {
+        for (remaining, expected) in [
+            (Some(100.0), "100%"),
+            (Some(0.0), "0%"),
+            (Some(0.3), "1%未満"),
+            (Some(99.7), "99%"),
+            (None, "—"),
+        ] {
+            assert_eq!(window(10080, remaining, None).remaining_label(), expected);
+        }
+    }
+
+    #[test]
+    fn main_window_prefers_the_weekly_window_of_the_first_group() {
+        let snapshot = |groups| Snapshot {
+            groups,
+            cap: None,
+            balance: None,
+            reset_credits: None,
+            blocked: None,
+            observed_at: Local::now(),
+        };
+        let both = snapshot(vec![Group::new(
+            None,
+            vec![
+                window(10080, Some(62.0), None),
+                window(300, Some(88.0), None),
+            ],
+        )]);
+        assert_eq!(both.groups[0].windows[0].label(), "5時間");
+        assert_eq!(both.main_window().unwrap().label(), "週次");
+        let monthly = snapshot(vec![Group::new(
+            None,
+            vec![window(300, Some(1.0), None), window(43200, Some(2.0), None)],
+        )]);
+        assert_eq!(monthly.main_window().unwrap().label(), "月次");
+        let extra_only = snapshot(vec![
+            Group::default(),
+            Group::new(Some("Spark".into()), vec![window(10080, None, None)]),
+        ]);
+        assert!(extra_only.main_window().is_none());
+    }
+
+    #[test]
+    fn blocking_waits_for_every_exhausted_window_and_any_recovering_group() {
+        let now = 1_000;
+        let group = Group::new(
+            None,
+            vec![
+                window(300, Some(0.0), Some(2_000)),
+                window(10080, Some(0.0), Some(9_000)),
+            ],
+        );
+        assert_eq!(
+            blocked(std::slice::from_ref(&group), now),
+            Some(Blocked {
+                label: "週次の枠".into(),
+                until: Some(9_000),
+                minutes: Some(10080),
+            })
+        );
+        // A window whose reset time has passed no longer blocks usage.
+        assert!(blocked(std::slice::from_ref(&group), 9_000).is_none());
+        let available = Group::new(
+            Some("Claude・GPT".into()),
+            vec![window(10080, Some(40.0), None)],
+        );
+        assert!(blocked(&[group.clone(), available], now).is_none());
+        let other = Group::new(
+            Some("Claude・GPT".into()),
+            vec![window(10080, Some(0.0), Some(5_000))],
+        );
+        assert_eq!(
+            blocked(&[group, other], now).unwrap().label,
+            "Claude・GPT・週次の枠"
+        );
+        let unknown = Group::new(None, vec![window(300, Some(0.0), None)]);
+        assert_eq!(blocked(&[unknown], now).unwrap().until, None);
+        assert!(blocked(&[], now).is_none());
+    }
 
     #[test]
     fn reset_credits_keep_the_server_count_and_sort_available_ticket_expiries() {
@@ -207,42 +392,5 @@ mod tests {
                 .details_complete()
         );
         assert!(ResetCredits::from_response(&Value::Null).is_none());
-    }
-
-    #[test]
-    fn identifies_week_by_duration_and_prefers_codex_bucket() {
-        let usage = Usage::from_response(json!({
-            "rateLimits": {"primary": {"windowDurationMins": 10080, "usedPercent": 99}},
-            "rateLimitsByLimitId": {"codex": {
-                "primary": {"windowDurationMins": 10080, "usedPercent": 81},
-                "secondary": {"windowDurationMins": 300, "usedPercent": 12}
-            }}
-        }))
-        .unwrap();
-        assert_eq!(usage.weekly.unwrap().remaining_label(), "19%");
-        assert_eq!(usage.short.unwrap().label(), "5時間");
-        assert!(Usage::from_response(json!({"rateLimitsByLimitId": {"other": {}}})).is_err());
-    }
-
-    #[test]
-    fn legacy_missing_values_and_rounding_do_not_invent_remaining_quota() {
-        for (used, expected) in [
-            (0.0, "100%"),
-            (100.0, "0%"),
-            (101.0, "0%"),
-            (99.7, "1%未満"),
-            (-1.0, "—"),
-        ] {
-            let usage = Usage::from_response(json!({"rateLimits": {
-                "secondary": {"windowDurationMins": 10080, "usedPercent": used}
-            }}))
-            .unwrap();
-            let week = usage.weekly.unwrap();
-            assert_eq!(week.remaining_label(), expected);
-            assert_eq!(week.resets_at, None);
-        }
-        let usage = Usage::from_response(json!({"rateLimits": {"primary": null}})).unwrap();
-        assert!(usage.weekly.is_none());
-        assert!(usage.short.is_none());
     }
 }

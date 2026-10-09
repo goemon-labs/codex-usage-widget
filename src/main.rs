@@ -1,14 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod codex;
-mod codex_app;
 mod instance;
 mod platform;
+mod process;
 mod quota;
+mod services;
 mod settings;
 
 use eframe::egui;
+use services::codex;
 use std::sync::{Arc, atomic::AtomicBool};
 
 fn main() -> eframe::Result {
@@ -34,15 +35,24 @@ fn main() -> eframe::Result {
             });
         match result {
             Ok(usage) => {
-                let window = |window: Option<quota::Window>| {
-                    window.map(|w| serde_json::json!({
-                    "window_minutes": w.minutes, "remaining_percent": w.remaining, "resets_at": w.resets_at,
-                }))
-                };
+                let groups: Vec<_> = usage.groups.iter().map(|group| serde_json::json!({
+                    "name": group.name,
+                    "windows": group.windows.iter().map(|w| serde_json::json!({
+                        "window_minutes": w.span.minutes(), "remaining_percent": w.remaining, "resets_at": w.resets_at,
+                    })).collect::<Vec<_>>(),
+                })).collect();
                 println!(
                     "{}",
                     serde_json::json!({
-                        "weekly": window(usage.weekly), "short": window(usage.short),
+                        "groups": groups,
+                        "cap": usage.cap.map(|cap| serde_json::json!({
+                            "label": cap.label, "remaining_percent": cap.remaining,
+                            "detail": cap.detail, "resets_at": cap.resets_at,
+                        })),
+                        "balance": usage.balance,
+                        "blocked": usage.blocked.map(|blocked| serde_json::json!({
+                            "label": blocked.label, "until": blocked.until,
+                        })),
                         "reset_credits": usage.reset_credits.map(|resets| serde_json::json!({
                             "available_count": resets.available_count,
                             "expires_at": resets.credits.map(|credits| credits.into_iter().map(|credit| credit.expires_at).collect::<Vec<_>>()),

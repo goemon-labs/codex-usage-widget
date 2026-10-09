@@ -1,7 +1,7 @@
 use crate::{
-    codex::{self, Account, ErrorKind, FetchError},
     platform::{self, Action},
-    quota::{Usage, Window},
+    quota::{Snapshot, Window},
+    services::codex::{self, Account, ErrorKind, FetchError},
     settings::Settings,
 };
 use chrono::{Datelike, Local, TimeZone};
@@ -41,7 +41,7 @@ pub fn window_size(bar_mode: bool) -> egui::Vec2 {
 enum FetchEvent {
     Detected(Option<codex::Installation>),
     Account(Account),
-    Finished(Result<Usage, FetchError>),
+    Finished(Result<Snapshot, FetchError>),
 }
 
 struct Worker {
@@ -60,7 +60,7 @@ pub struct Widget {
     topmost: Option<platform::topmost::Topmost>,
     instance: Option<crate::instance::Instance>,
     installation: Option<codex::Installation>,
-    usage: Option<Usage>,
+    usage: Option<Snapshot>,
     account: Option<Account>,
     error: Option<FetchError>,
     notice: Option<String>,
@@ -240,12 +240,16 @@ impl Widget {
                                     .map_or(now + 300, |reset| reset.min(now + 300)),
                             );
                             if let Some(tray) = &self.tray {
-                                let text = usage
-                                    .weekly
-                                    .as_ref()
-                                    .map_or("週次の情報を確認中".into(), |window| {
-                                        format!("週次の残り {}", window.remaining_label())
-                                    });
+                                let text = usage.main_window().map_or(
+                                    "利用枠を確認中".into(),
+                                    |window| {
+                                        format!(
+                                            "{}の残り {}",
+                                            window.label(),
+                                            window.remaining_label()
+                                        )
+                                    },
+                                );
                                 let _ = tray.set_tooltip(Some(format!("Codex · {text}")));
                             }
                             self.usage = Some(usage);
@@ -417,7 +421,7 @@ impl Widget {
     fn header(&mut self, ui: &mut egui::Ui, compact: bool) {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
-            let weekly = self.usage.as_ref().and_then(|usage| usage.weekly.as_ref());
+            let weekly = self.usage.as_ref().and_then(Snapshot::main_window);
             let current = weekly.filter(|window| !window.expired(Local::now().timestamp()));
             let dot = if compact && self.error.is_some() {
                 Color32::from_rgb(225, 180, 107)
@@ -448,7 +452,7 @@ impl Widget {
         ui.add_space(17.0);
         ui.label(RichText::new("週次の残り").size(11.0).color(MUTED));
         ui.add_space(1.0);
-        let weekly = self.usage.as_ref().and_then(|usage| usage.weekly.as_ref());
+        let weekly = self.usage.as_ref().and_then(Snapshot::main_window);
         let expired = weekly.is_some_and(|window| window.expired(now));
         let label = if expired {
             "—".into()
@@ -484,10 +488,24 @@ impl Widget {
             "Codexの利用枠を確認します".into()
         };
         ui.label(RichText::new(reset).size(12.0));
-        ui.add_space(21.0);
-        self.reset_credits_ui(ui, now);
+        // Only some plans earn reset credits; keep the row in place until the first response.
+        if self
+            .usage
+            .as_ref()
+            .is_none_or(|usage| usage.reset_credits.is_some())
+        {
+            ui.add_space(21.0);
+            self.reset_credits_ui(ui, now);
+        }
 
-        if let Some(short) = self.usage.as_ref().and_then(|usage| usage.short.as_ref()) {
+        let short = self.usage.as_ref().and_then(|usage| {
+            let main = usage.main_window()?;
+            usage.groups[0]
+                .windows
+                .iter()
+                .find(|window| !std::ptr::eq(*window, main))
+        });
+        if let Some(short) = short {
             ui.add_space(18.0);
             ui.horizontal(|ui| {
                 ui.label(
@@ -648,12 +666,12 @@ impl Widget {
 
     fn footer_ui(&mut self, ui: &mut egui::Ui) {
         let fetched = self.usage.as_ref().map(|usage| {
-            let format = if usage.fetched_at.date_naive() == Local::now().date_naive() {
+            let format = if usage.observed_at.date_naive() == Local::now().date_naive() {
                 "%H:%M"
             } else {
                 "%-m/%-d %H:%M"
             };
-            usage.fetched_at.format(format).to_string()
+            usage.observed_at.format(format).to_string()
         });
         let status = if self.worker.is_some() {
             "更新中…".into()
@@ -1108,15 +1126,20 @@ mod tests {
         };
         for (remaining, expected) in [(None, "—"), (Some(100.0), "100%"), (Some(0.5), "1%未満")]
         {
-            widget.usage = Some(Usage {
-                weekly: Some(Window {
-                    minutes: 10080,
-                    remaining,
-                    resets_at: None,
-                }),
-                short: None,
+            widget.usage = Some(Snapshot {
+                groups: vec![crate::quota::Group::new(
+                    None,
+                    vec![Window {
+                        span: crate::quota::Span::Minutes(10080),
+                        remaining,
+                        resets_at: None,
+                    }],
+                )],
+                cap: None,
+                balance: None,
                 reset_credits: None,
-                fetched_at: Local::now(),
+                blocked: None,
+                observed_at: Local::now(),
             });
             step(&mut widget, vec![]).drop_without_applying_deltas();
             let output = step(&mut widget, vec![]);
