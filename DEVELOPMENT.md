@@ -105,7 +105,7 @@ Windowsではテストとインストーラーの作成も行います。生成�
 依存ライブラリを変更した場合は、cargo-about 0.9.2でライセンス一覧を更新します。
 
 ```sh
-cargo install cargo-about --version 0.9.2 --locked
+cargo install cargo-about --version 0.9.2 --locked --features cli
 cargo about generate --locked scripts/licenses.hbs --output-file THIRD-PARTY-LICENSES.md
 ```
 
