@@ -654,61 +654,47 @@ impl Widget {
     /// Every selected service in one card, each in its own section.
     fn combined_ui(&mut self, ui: &mut egui::Ui) {
         let now = Local::now().timestamp();
-        for (index, service) in self.settings.services.clone().into_iter().enumerate() {
-            ui.add_space(if index == 0 { 14.0 } else { 12.0 });
+        let services = self.settings.services.clone();
+        let sections: Vec<_> = services
+            .iter()
+            .map(|&service| {
+                let source = self.source(service);
+                match self.snapshot(service) {
+                    Some(snapshot) => (
+                        service,
+                        card::rows(snapshot, source.received, now),
+                        "利用枠の情報を取得できませんでした".to_string(),
+                    ),
+                    None => (service, Vec::new(), card::hero(None, &source, now).when),
+                }
+            })
+            .collect();
+        let value_width = card::value_width(ui, sections.iter().flat_map(|(_, rows, _)| rows));
+        for (index, (service, rows, empty)) in sections.into_iter().enumerate() {
+            ui.add_space(if index == 0 { 14.0 } else { 16.0 });
             self.section_header(ui, service);
-            let source = self.source(service);
-            let (rows, resets, empty) = match self.snapshot(service) {
-                Some(snapshot) => (
-                    card::rows(snapshot, source.received, now),
-                    snapshot
-                        .reset_credits
-                        .as_ref()
-                        .map(|resets| resets.available_count),
-                    "利用枠の情報を取得できませんでした".into(),
-                ),
-                None => (Vec::new(), None, card::hero(None, &source, now).when),
-            };
             for row in &rows {
-                card::row_ui(ui, row);
+                card::row_ui(ui, row, value_width);
+                ui.add_space(4.0);
             }
             if rows.is_empty() {
-                ui.label(RichText::new(empty).size(11.0).color(MUTED));
-            }
-            if let Some(count) = resets {
-                ui.label(
-                    RichText::new(format!("リセット権 {count}枚"))
-                        .size(11.0)
-                        .color(MUTED),
-                );
+                ui.label(RichText::new(empty).size(12.0).color(MUTED));
             }
             if service == ServiceId::Codex
                 && let Some(error) = &self.error
             {
                 ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
             } else if service.received() && !self.settings.bridges.contains_key(&service) {
-                ui.label(RichText::new("連携していません").size(11.0).color(MUTED));
+                ui.label(RichText::new("連携していません").size(12.0).color(MUTED));
             }
         }
         let used_height = ui.cursor().top() - ui.min_rect().top();
         ui.add_space((HEIGHT - 42.0 - used_height - 24.0).max(16.0));
-        if self.shows(ServiceId::Codex) {
-            self.footer_ui(ui, ServiceId::Codex);
-        } else {
-            ui.label(
-                RichText::new("各サービスの利用時に更新")
-                    .size(10.0)
-                    .color(MUTED),
-            );
-        }
+        self.footer_ui(ui, &services);
     }
 
-    /// The service name opens its own card; received services also say when they last reported.
+    /// The service name opens its own card.
     fn section_header(&mut self, ui: &mut egui::Ui, service: ServiceId) {
-        let status = self
-            .snapshot(service)
-            .filter(|_| service.received())
-            .map(|snapshot| format!("受信 {}", time_label(snapshot.observed_at)));
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
         response.widget_info(|| {
@@ -723,18 +709,9 @@ impl Widget {
             rect.left_center(),
             egui::Align2::LEFT_CENTER,
             service.name(),
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(14.0),
             FOREGROUND,
         );
-        if let Some(status) = status {
-            painter.text(
-                rect.right_center() - vec2(14.0, 0.0),
-                egui::Align2::RIGHT_CENTER,
-                status,
-                egui::FontId::proportional(10.0),
-                MUTED,
-            );
-        }
         let color = if response.hovered() {
             FOREGROUND
         } else {
@@ -849,7 +826,7 @@ impl Widget {
         // Keep the footer in the content flow so expanded details cannot overlap it.
         let used_height = ui.cursor().top() - ui.min_rect().top();
         ui.add_space((HEIGHT - 42.0 - used_height - 24.0).max(22.0));
-        self.footer_ui(ui, service);
+        self.footer_ui(ui, &[service]);
     }
 
     fn reset_credits_ui(&mut self, ui: &mut egui::Ui, now: i64) {
@@ -957,12 +934,7 @@ impl Widget {
             let label = if resets.is_some_and(|resets| resets.available_count == 0) {
                 "チケットは0枚です".into()
             } else if let Some(credit) = first {
-                let caption = if resets.is_some_and(|resets| resets.details_complete()) {
-                    "最短"
-                } else {
-                    "確認済み"
-                };
-                format!("{caption}  {}", credit_expiry_label(credit.expires_at, now))
+                credit_expiry_label(credit.expires_at, now)
             } else if self.worker.is_some() && self.usage.is_none() {
                 "取得中…".into()
             } else {
@@ -972,40 +944,34 @@ impl Widget {
         }
     }
 
-    fn footer_ui(&mut self, ui: &mut egui::Ui, service: ServiceId) {
-        // Received usage cannot be requested; say when it arrived and what updates it.
-        if service.received() {
-            let status = match self.snapshot(service) {
-                Some(snapshot) => format!(
-                    "受信 {}（{}の利用時に更新）",
-                    time_label(snapshot.observed_at),
-                    service.name()
-                ),
-                None => format!("{}の利用時に更新", service.name()),
-            };
-            ui.label(RichText::new(status).size(10.0).color(MUTED));
-            return;
-        }
-        let fetched = self
-            .usage
-            .as_ref()
-            .map(|usage| time_label(usage.observed_at));
-        let status = if self.worker.is_some() {
+    /// When the numbers on screen were last updated, with a refresh button for Codex.
+    fn footer_ui(&mut self, ui: &mut egui::Ui, services: &[ServiceId]) {
+        let codex = services.contains(&ServiceId::Codex);
+        let latest = services
+            .iter()
+            .filter_map(|&service| self.snapshot(service))
+            .map(|snapshot| snapshot.observed_at)
+            .max();
+        let status = if codex && self.worker.is_some() {
             "更新中…".into()
-        } else if let Some(time) = fetched {
-            format!(
-                "{} {time}",
-                if self.error.is_some() {
-                    "前回取得"
-                } else {
-                    "更新"
-                }
-            )
-        } else {
+        } else if let Some(time) = latest {
+            // A failed Codex fetch keeps showing the numbers it fetched before.
+            let caption = if codex && services.len() == 1 && self.error.is_some() {
+                "前回取得"
+            } else {
+                "更新"
+            };
+            format!("{caption} {}", time_label(time))
+        } else if codex {
             "5分ごとに更新".into()
+        } else {
+            String::new()
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(status).size(10.0).color(MUTED));
+            if !codex {
+                return;
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let enabled = self.worker.is_none()
                     && self
@@ -1830,7 +1796,8 @@ mod tests {
             "Claude Code",
             "5時間",
             "週次",
-            "あと2:13",
+            "0%",
+            "62%",
         ] {
             assert!(has(&combined, wanted), "{wanted}");
         }
