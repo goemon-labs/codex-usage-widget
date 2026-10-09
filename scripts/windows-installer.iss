@@ -55,28 +55,51 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExecutable}"; WorkingDir
 ; official Codex CLI's user-created junction with Windows error 448.
 
 [Code]
-procedure RemoveRunEntry(const Name, Executable: String);
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  ApprovedKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run';
+
+function IsRunEntryFor(const Name, Executable: String): Boolean;
 var
   Command: String;
 begin
-  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', Name, Command) then
+  Result := RegQueryStringValue(HKCU, RunKey, Name, Command);
+  if Result then
   begin
     Command := Trim(Command);
-    if (CompareText(Command, Executable) = 0) or
-       (CompareText(Command, '"' + Executable + '"') = 0) then
-    begin
-      RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', Name);
-      RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', Name);
-    end;
+    Result := (CompareText(Command, Executable) = 0) or
+              (CompareText(Command, '"' + Executable + '"') = 0);
+  end;
+end;
+
+procedure RemoveRunEntry(const Name, Executable: String);
+begin
+  if IsRunEntryFor(Name, Executable) then
+  begin
+    RegDeleteValue(HKCU, RunKey, Name);
+    RegDeleteValue(HKCU, ApprovedKey, Name);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  State: AnsiString;
+begin
+  // Keep starting at login when updating over the Codex Usage Widget versions,
+  // even before ReCast is opened for the first time.
+  if (CurStep = ssPostInstall) and
+     IsRunEntryFor('Codex Usage Widget', ExpandConstant('{app}\codex-usage-widget.exe')) then
+  begin
+    RegWriteStringValue(HKCU, RunKey, '{#AppName}', '"' + ExpandConstant('{app}\{#AppExecutable}') + '"');
+    // A login item turned off in Task Manager stays off.
+    if RegQueryBinaryValue(HKCU, ApprovedKey, 'Codex Usage Widget', State) then
+      RegWriteBinaryValue(HKCU, ApprovedKey, '{#AppName}', State);
+    RemoveRunEntry('Codex Usage Widget', ExpandConstant('{app}\codex-usage-widget.exe'));
   end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
-  begin
     RemoveRunEntry('{#AppName}', ExpandConstant('{app}\{#AppExecutable}'));
-    // A login item left by the Codex Usage Widget versions if ReCast never started.
-    RemoveRunEntry('Codex Usage Widget', ExpandConstant('{app}\codex-usage-widget.exe'));
-  end;
 end;
