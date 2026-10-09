@@ -25,7 +25,6 @@ pub const SETUP_GUIDANCE: &str = "Codexが見つかりません。CLIまたは�
 #[derive(Clone, Debug)]
 pub struct Installation {
     pub path: PathBuf,
-    pub is_app: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,17 +64,13 @@ impl FetchError {
 }
 
 pub fn find_app() -> Option<Installation> {
-    super::codex_app::find().map(|path| Installation { path, is_app: true })
+    super::codex_app::find().map(|path| Installation { path })
 }
 
 pub fn find_codex(configured: Option<&Path>) -> Option<Installation> {
     if let Some(path) = configured {
-        if let Some(path) = super::codex_app::from_path(path) {
-            return Some(Installation { path, is_app: true });
-        }
-        let path = native_path(path)?;
-        let is_app = super::codex_app::find().is_some_and(|app| app == path);
-        return Some(Installation { path, is_app });
+        let path = super::codex_app::from_path(path).or_else(|| native_path(path))?;
+        return Some(Installation { path });
     }
     let mut paths = Vec::new();
     if let Some(path) = env::var_os("PATH") {
@@ -107,10 +102,7 @@ pub fn find_codex(configured: Option<&Path>) -> Option<Installation> {
     paths
         .into_iter()
         .find_map(|path| native_path(&path))
-        .map(|path| Installation {
-            path,
-            is_app: false,
-        })
+        .map(|path| Installation { path })
         .or_else(find_app)
 }
 
@@ -413,6 +405,15 @@ impl RawSnapshot {
     }
 }
 
+/// Credits arrive as decimal text in Codex's own unit; like Codex, show whole credits.
+fn credits(raw: &str) -> String {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map_or_else(|| raw.to_string(), quota::amount_label)
+}
+
 /// Convert an `account/rateLimits/read` response into display data.
 fn snapshot(response: &Value, now: i64) -> Result<Snapshot, &'static str> {
     let buckets = response
@@ -453,14 +454,18 @@ fn snapshot(response: &Value, now: i64) -> Result<Snapshot, &'static str> {
         remaining: Some(limit.remaining_percent)
             .filter(|value| value.is_finite())
             .map(|value| value.clamp(0.0, 100.0)),
-        detail: Some(format!("{} / {} クレジット使用", limit.used, limit.limit)),
+        detail: Some(format!(
+            "{} / {} クレジット使用",
+            credits(&limit.used),
+            credits(&limit.limit)
+        )),
         resets_at: Some(limit.resets_at).filter(|value| *value > 0),
     });
-    let balance = main.credits.and_then(|credits| {
-        if credits.unlimited {
+    let balance = main.credits.and_then(|account| {
+        if account.unlimited {
             Some("無制限".into())
-        } else if credits.has_credits {
-            credits.balance
+        } else if account.has_credits {
+            account.balance.as_deref().map(credits)
         } else {
             None
         }
@@ -630,7 +635,7 @@ mod tests {
         let usage = snapshot(
             &json!({"rateLimits": {
                 "limitId": "codex",
-                "credits": {"hasCredits": true, "unlimited": false, "balance": "1250"},
+                "credits": {"hasCredits": true, "unlimited": false, "balance": "62500.3712345678"},
                 "individualLimit": {"limit": "500", "used": "314",
                     "remainingPercent": 37.2, "resetsAt": 1_800_000_000}
             }}),
@@ -639,7 +644,7 @@ mod tests {
         .unwrap();
         assert!(usage.main_window().is_none());
         assert!(usage.reset_credits.is_none());
-        assert_eq!(usage.balance.as_deref(), Some("1250"));
+        assert_eq!(usage.balance.as_deref(), Some("62,500"));
         let cap = usage.cap.unwrap();
         assert_eq!(cap.label, "月間クレジット上限");
         assert_eq!(cap.detail.as_deref(), Some("314 / 500 クレジット使用"));

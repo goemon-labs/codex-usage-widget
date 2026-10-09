@@ -116,7 +116,13 @@ fn spend_limit(entry: &Value) -> Option<Cap> {
         remaining: Some((100.0 - used).clamp(0.0, 100.0)),
         detail: amount("used_usd")
             .zip(amount("limit_usd"))
-            .map(|(used, limit)| format!("${used:.2} / ${limit:.2} 使用")),
+            .map(|(used, limit)| {
+                format!(
+                    "${} / ${} 使用",
+                    quota::amount_label(used),
+                    quota::amount_label(limit)
+                )
+            }),
         resets_at: timestamp(entry.get("resets_at")),
     })
 }
@@ -225,7 +231,7 @@ mod tests {
         );
         let cap = spend.cap.as_ref().unwrap();
         assert_eq!(cap.label, "今月の利用額の上限");
-        assert_eq!(cap.detail.as_deref(), Some("$520.50 / $500.00 使用"));
+        assert_eq!(cap.detail.as_deref(), Some("$521 / $500 使用"));
         assert!(spend.main_window().is_none());
         assert_eq!(spend.blocked.unwrap().until, Some(NOW + 900));
         let percent_only = snapshot(

@@ -32,7 +32,6 @@ pub const HEIGHT: f32 = 320.0;
 const BAR_WIDTH: f32 = 212.0;
 const BAR_HEIGHT: f32 = 40.0;
 const MENU_SPACE: f32 = 208.0;
-const SETTINGS_HEIGHT: f32 = 440.0;
 const BACKGROUND: Color32 = Color32::from_rgb(20, 24, 29);
 const FOREGROUND: Color32 = Color32::from_rgb(233, 239, 242);
 const MUTED: Color32 = Color32::from_rgb(145, 157, 168);
@@ -49,7 +48,6 @@ pub fn window_size(bar_mode: bool) -> egui::Vec2 {
 }
 
 enum FetchEvent {
-    Detected(Option<codex::Installation>),
     Account(Account),
     Finished(Result<Snapshot, FetchError>),
     Received(ServiceId, Snapshot),
@@ -123,7 +121,6 @@ pub struct Widget {
     #[cfg(windows)]
     topmost: Option<platform::topmost::Topmost>,
     instance: Option<crate::instance::Instance>,
-    installation: Option<codex::Installation>,
     /// Codex usage from the latest fetch.
     usage: Option<Snapshot>,
     /// Usage that other tools reported while running.
@@ -133,8 +130,8 @@ pub struct Widget {
     notice: Option<String>,
     worker: Option<Worker>,
     watcher: Option<Watcher>,
-    /// A status line registration waiting for the user to confirm it.
-    confirm_link: Option<ServiceId>,
+    /// A service whose registration failed, offered for manual setup.
+    failed_link: Option<ServiceId>,
     /// The service opened from the combined view.
     detail: Option<ServiceId>,
     /// Services found on the first launch, waiting for the user to pick what to show.
@@ -203,7 +200,6 @@ impl Widget {
             #[cfg(windows)]
             topmost: None,
             instance: None,
-            installation: None,
             usage: None,
             received: BTreeMap::new(),
             account: None,
@@ -211,7 +207,7 @@ impl Widget {
             notice: None,
             worker: None,
             watcher: None,
-            confirm_link: None,
+            failed_link: None,
             detail: None,
             choices: None,
             started: false,
@@ -337,8 +333,6 @@ impl Widget {
         let context = ctx.clone();
         let handle = thread::spawn(move || {
             let installation = codex::find_codex(configured.as_deref());
-            let _ = sender.send(FetchEvent::Detected(installation.clone()));
-            context.request_repaint();
             let result = installation
                 .ok_or_else(|| FetchError {
                     kind: ErrorKind::Setup,
@@ -359,7 +353,6 @@ impl Widget {
     fn receive_results(&mut self) {
         while let Ok(event) = self.fetch_rx.try_recv() {
             match event {
-                FetchEvent::Detected(installation) => self.installation = installation,
                 FetchEvent::Account(account) => {
                     if self.account.as_ref() != Some(&account) {
                         self.usage = None;
@@ -614,7 +607,11 @@ impl Widget {
             if compact {
                 ui.label(RichText::new(self.bar_text(now)).size(13.0));
             } else {
-                let title = shown.map_or("利用状況", ServiceId::name);
+                let title = if self.settings_open {
+                    "設定"
+                } else {
+                    shown.map_or("利用状況", ServiceId::name)
+                };
                 ui.label(RichText::new(title).size(14.0).strong());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -690,11 +687,7 @@ impl Widget {
             {
                 ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
             } else if service.received() && !self.settings.bridges.contains_key(&service) {
-                ui.label(
-                    RichText::new(format!("{}と連携すると表示されます。", service.name()))
-                        .size(11.0)
-                        .color(MUTED),
-                );
+                ui.label(RichText::new("連携していません").size(11.0).color(MUTED));
             }
         }
         let used_height = ui.cursor().top() - ui.min_rect().top();
@@ -764,7 +757,7 @@ impl Widget {
         }
     }
 
-    /// Shown on the first launch when more than one service is installed.
+    /// Shown on the first launch when a service other than Codex is installed.
     fn choose_ui(&mut self, ui: &mut egui::Ui, choices: Vec<ServiceId>) {
         ui.add_space(17.0);
         ui.label(RichText::new("表示するサービスを選んでください").size(13.0));
@@ -775,7 +768,7 @@ impl Widget {
                 chosen = Some(vec![service]);
             }
         }
-        if ui.button("まとめて表示").clicked() {
+        if choices.len() > 1 && ui.button("まとめて表示").clicked() {
             chosen = Some(choices);
         }
         ui.add_space(6.0);
@@ -785,26 +778,27 @@ impl Widget {
                 .color(MUTED),
         );
         if let Some(services) = chosen {
-            self.settings.services = services;
             self.choices = None;
-            self.services_changed(ui.ctx());
+            self.settings.services.clear();
+            for service in services {
+                self.select(ui.ctx(), service, true);
+            }
+            if self.settings.services.is_empty() {
+                self.settings.services.push(ServiceId::Codex);
+                self.services_changed(ui.ctx());
+            }
         }
     }
 
-    /// Show what is installed on the first launch, asking only when there is a choice.
-    fn first_run(&mut self, ctx: &egui::Context) {
+    /// Codex alone needs no choice; connecting another tool waits for the user to pick it.
+    fn first_run(&mut self) {
         self.settings.first_run = false;
         let found: Vec<_> = ServiceId::ALL
             .into_iter()
             .filter(|service| service.detected())
             .collect();
-        match found.as_slice() {
-            [] => {}
-            [only] => {
-                self.settings.services = vec![*only];
-                self.services_changed(ctx);
-            }
-            _ => self.choices = Some(found),
+        if found.iter().any(|service| service.received()) {
+            self.choices = Some(found);
         }
     }
 
@@ -843,12 +837,9 @@ impl Widget {
         } else if service.received() && !self.settings.bridges.contains_key(&service) {
             ui.add_space(15.0);
             ui.label(
-                RichText::new(format!(
-                    "{}と連携すると、使っている間に残量が届きます。",
-                    service.name()
-                ))
-                .size(11.0)
-                .color(MUTED),
+                RichText::new(format!("{}に連携していません", service.name()))
+                    .size(11.0)
+                    .color(MUTED),
             );
             if ui.small_button("設定を開く").clicked() {
                 self.settings_open = true;
@@ -1064,40 +1055,11 @@ impl Widget {
         });
     }
 
+    /// Choose the services to show and see whether each one is connected.
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(17.0);
-        egui::ScrollArea::vertical()
-            .id_salt("settings")
-            .max_height(SETTINGS_HEIGHT)
-            .auto_shrink([false, true])
-            .scroll_source(egui::scroll_area::ScrollSource {
-                drag: egui::scroll_area::DragScroll::Never,
-                ..Default::default()
-            })
-            .show(ui, |ui| {
-                self.services_settings_ui(ui);
-                for service in self.settings.services.clone() {
-                    ui.add_space(16.0);
-                    match service {
-                        ServiceId::Codex => self.codex_settings_ui(ui),
-                        _ => self.bridge_settings_ui(ui, service),
-                    }
-                }
-                if let Some(notice) = &self.notice {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(notice).size(11.0).color(MUTED));
-                }
-                ui.add_space(18.0);
-                ui.label(
-                    RichText::new(format!("Codex Usage Widget  {}", env!("CARGO_PKG_VERSION")))
-                        .size(10.0)
-                        .color(MUTED),
-                );
-            });
-    }
-
-    fn services_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("表示するサービス").strong());
+        ui.add_space(4.0);
         // Selected services in display order, then the others.
         let listed: Vec<_> = self
             .settings
@@ -1110,47 +1072,179 @@ impl Widget {
                     .filter(|service| !self.shows(*service)),
             )
             .collect();
-        let mut changed = false;
         for service in listed {
-            ui.horizontal(|ui| {
-                let position = self.settings.services.iter().position(|s| *s == service);
-                let mut shown = position.is_some();
-                // At least one service stays selected.
-                let locked = shown && self.settings.services.len() == 1;
-                let label = if service.experimental() {
-                    format!("{}（実験的）", service.name())
-                } else {
-                    service.name().into()
-                };
-                if ui
-                    .add_enabled(!locked, egui::Checkbox::new(&mut shown, label))
-                    .changed()
-                {
-                    if shown {
-                        self.settings.services.push(service);
-                    } else {
-                        self.settings
-                            .services
-                            .retain(|selected| *selected != service);
-                    }
-                    changed = true;
-                }
-                if let Some(index) = position.filter(|index| *index > 0)
-                    && ui.small_button("上へ").clicked()
-                {
-                    self.settings.services.swap(index, index - 1);
-                    changed = true;
-                }
-            });
+            self.service_row(ui, service);
         }
-        if changed {
-            self.services_changed(ui.ctx());
+        if self.shows(ServiceId::Codex)
+            && (self.codex_missing() || self.settings.codex_path.is_some())
+        {
+            ui.add_space(8.0);
+            self.codex_location_ui(ui);
         }
+        if let Some(notice) = &self.notice {
+            ui.add_space(8.0);
+            ui.label(RichText::new(notice).size(11.0).color(MUTED));
+        }
+        if let Some(service) = self.failed_link
+            && let Ok(command) = bridge::command(service)
+            && ui.small_button("コマンドをコピー").clicked()
+        {
+            ui.ctx().copy_text(command);
+        }
+        ui.add_space(18.0);
         ui.label(
-            RichText::new("2つ以上選ぶと、まとめて表示します。")
-                .size(11.0)
+            RichText::new(format!("Codex Usage Widget  {}", env!("CARGO_PKG_VERSION")))
+                .size(10.0)
                 .color(MUTED),
         );
+    }
+
+    /// One service: whether it is shown, how it stands, and its place in the order.
+    fn service_row(&mut self, ui: &mut egui::Ui, service: ServiceId) {
+        let position = self.settings.services.iter().position(|s| *s == service);
+        let shown = position.is_some();
+        // Codex is looked up when it is fetched; tools that report on their own must be installed.
+        let available = shown || !service.received() || service.detected();
+        ui.horizontal(|ui| {
+            let mut checked = shown;
+            // At least one service stays selected.
+            let locked = shown && self.settings.services.len() == 1;
+            let label = if service.experimental() {
+                format!("{}（実験的）", service.name())
+            } else {
+                service.name().into()
+            };
+            if ui
+                .add_enabled(
+                    available && !locked,
+                    egui::Checkbox::new(&mut checked, label),
+                )
+                .changed()
+            {
+                self.select(ui.ctx(), service, checked);
+            }
+            if let Some(index) = position.filter(|index| *index > 0) {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if move_up_button(ui).clicked() {
+                        self.settings.services.swap(index, index - 1);
+                        self.services_changed(ui.ctx());
+                    }
+                });
+            }
+        });
+        let status = self.service_status(service, available);
+        if !status.is_empty() {
+            ui.horizontal(|ui| {
+                // Line up with the checkbox label.
+                ui.add_space(18.0);
+                ui.label(RichText::new(status).size(11.0).color(MUTED));
+            });
+        }
+        ui.add_space(2.0);
+    }
+
+    fn service_status(&self, service: ServiceId, available: bool) -> String {
+        if !available {
+            return "見つかりません".into();
+        }
+        if !self.shows(service) {
+            return String::new();
+        }
+        if service == ServiceId::Codex {
+            return self.codex_status();
+        }
+        match (
+            self.settings.bridges.contains_key(&service),
+            self.received.get(&service),
+        ) {
+            (false, _) => "連携していません".into(),
+            (true, Some(snapshot)) => format!("{}に受信", time_label(snapshot.observed_at)),
+            (true, None) => format!("{}を使うと届きます", service.name()),
+        }
+    }
+
+    fn codex_status(&self) -> String {
+        if let Some(error) = &self.error {
+            return match error.kind {
+                ErrorKind::Setup => "見つかりません",
+                ErrorKind::Login => "ログインが必要です",
+                ErrorKind::Connection => "接続できません",
+                ErrorKind::Unsupported => "Codexの更新が必要です",
+                ErrorKind::Cancelled => "",
+            }
+            .into();
+        }
+        if self.worker.is_some() && self.usage.is_none() {
+            return "確認中…".into();
+        }
+        match self
+            .account
+            .as_ref()
+            .and_then(|account| account.plan.as_deref())
+        {
+            Some(plan) => format!("接続中（{}）", plan_name(plan)),
+            None if self.usage.is_some() => "接続中".into(),
+            None => String::new(),
+        }
+    }
+
+    fn codex_missing(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|error| matches!(error.kind, ErrorKind::Setup | ErrorKind::Login))
+    }
+
+    /// Only needed when Codex cannot be found automatically.
+    fn codex_location_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(self.worker.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Codexの場所を選択").clicked() {
+                    let dialog = rfd::FileDialog::new().set_title("公式Codexの実行ファイルを選択");
+                    #[cfg(windows)]
+                    let dialog = dialog.add_filter("Codex", &["exe", "cmd"]);
+                    if let Some(path) = dialog.pick_file() {
+                        self.settings.codex_path = Some(path);
+                        self.reset_connection(ui.ctx());
+                    }
+                }
+                if self.settings.codex_path.is_some() && ui.button("自動検出").clicked() {
+                    self.settings.codex_path = None;
+                    self.reset_connection(ui.ctx());
+                }
+            });
+        });
+        if self.codex_missing() {
+            ui.hyperlink_to(
+                "公式の導入・ログイン手順",
+                "https://learn.chatgpt.com/docs/quickstart?setup=app",
+            );
+        }
+    }
+
+    /// Showing a service that reports on its own also connects it; hiding it undoes that.
+    fn select(&mut self, ctx: &egui::Context, service: ServiceId, show: bool) {
+        self.notice = None;
+        self.failed_link = None;
+        if service.received() {
+            let result = if show {
+                self.link(service)
+            } else {
+                self.unlink(service)
+            };
+            if let Err(message) = result {
+                self.notice = Some(format!("{}：{message}", service.name()));
+                self.failed_link = show.then_some(service);
+                return;
+            }
+        }
+        if show {
+            self.settings.services.push(service);
+        } else {
+            self.settings
+                .services
+                .retain(|selected| *selected != service);
+        }
+        self.services_changed(ctx);
     }
 
     fn services_changed(&mut self, ctx: &egui::Context) {
@@ -1168,116 +1262,36 @@ impl Widget {
         }
     }
 
-    fn bridge_settings_ui(&mut self, ui: &mut egui::Ui, service: ServiceId) {
-        ui.label(RichText::new(format!("{}との連携", service.name())).strong());
-        let linked = self.settings.bridges.contains_key(&service);
-        let status = match (linked, self.received.get(&service)) {
-            (true, Some(snapshot)) => format!(
-                "連携しています（受信 {}）",
-                time_label(snapshot.observed_at)
-            ),
-            (true, None) => format!(
-                "連携しています。{}でメッセージを送ると、残量が届きます。",
-                service.name()
-            ),
-            (false, _) => "連携していません".into(),
-        };
-        ui.label(RichText::new(status).size(12.0).color(MUTED));
-        let file = bridge::tool_settings(service)
-            .map_or_else(String::new, |path| path.display().to_string());
-        if self.confirm_link == Some(service) {
-            // Antigravity CLI keeps its built-in line; Claude Code shows the widget's summary.
-            let shown = if service == ServiceId::AntigravityCli {
-                "これまでの表示はそのまま残ります。実験的な機能です。".to_string()
-            } else {
-                format!(
-                    "ステータスラインを使っていない場合は、{}の画面下部に残量が表示されます。",
-                    service.name()
-                )
-            };
-            ui.label(
-                RichText::new(format!(
-                    "{}の設定ファイル（{file}）のステータスラインに、残量を受け取るコマンドを登録します。\
-                     いまのステータスラインは表示されたまま残り、解除すると元の設定に戻ります。{shown}",
-                    service.name()
-                ))
-                .size(11.0),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("登録する").clicked() {
-                    self.link(service);
-                }
-                if ui.button("キャンセル").clicked() {
-                    self.confirm_link = None;
-                }
-            });
-        } else if linked {
-            if ui.button("連携を解除").clicked() {
-                self.unlink(service);
-            }
-        } else if ui.button("連携する").clicked() {
-            self.confirm_link = Some(service);
+    fn link(&mut self, service: ServiceId) -> Result<(), String> {
+        if self.settings.bridges.contains_key(&service) {
+            return Ok(());
         }
-        egui::CollapsingHeader::new(RichText::new("手動で設定する場合").size(11.0))
-            .id_salt(("manual", service))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{file} の statusLine に、type \"command\" と次の command を設定してください。"
-                    ))
-                    .size(11.0)
-                    .color(MUTED),
-                );
-                if let Ok(command) = bridge::command(service) {
-                    ui.label(RichText::new(&command).size(10.0).monospace());
-                    if ui.small_button("コマンドをコピー").clicked() {
-                        ui.ctx().copy_text(command);
-                    }
-                }
-            });
+        let record = bridge::link(service, None)?;
+        self.settings.bridges.insert(service, record);
+        self.notice = Some(format!("{}に連携しました", service.name()));
+        Ok(())
     }
 
-    fn link(&mut self, service: ServiceId) {
-        self.confirm_link = None;
-        match bridge::link(service, self.settings.bridges.get(&service)) {
-            Ok(record) => {
-                self.settings.bridges.insert(service, record);
-                self.notice = Some(format!(
-                    "{}と連携しました。次に{}を使うと、残量が届きます。",
-                    service.name(),
-                    service.name()
-                ));
-                self.persist();
-            }
-            Err(message) => self.notice = Some(message),
-        }
-    }
-
-    fn unlink(&mut self, service: ServiceId) {
+    fn unlink(&mut self, service: ServiceId) -> Result<(), String> {
         let Some(record) = self.settings.bridges.get(&service).cloned() else {
-            return;
+            return Ok(());
         };
-        match bridge::unlink(service, &record) {
-            Ok(restored) => {
-                self.settings.bridges.remove(&service);
-                self.received.remove(&service);
-                // Numbers that can no longer be updated would only mislead.
-                if let Some(path) = bridge::received_path(service) {
-                    let _ = fs::remove_file(path);
-                }
-                self.notice = Some(if restored {
-                    "連携を解除し、元の設定に戻しました。".into()
-                } else {
-                    format!(
-                        "{}の設定はすでに変更されていたため、そのままにしました。",
-                        service.name()
-                    )
-                });
-                self.persist();
-                self.update_tray();
-            }
-            Err(message) => self.notice = Some(message),
+        let restored = bridge::unlink(service, &record)?;
+        self.settings.bridges.remove(&service);
+        self.received.remove(&service);
+        // Numbers that can no longer be updated would only mislead.
+        if let Some(path) = bridge::received_path(service) {
+            let _ = fs::remove_file(path);
         }
+        self.notice = Some(if restored {
+            format!("{}の連携を解除しました", service.name())
+        } else {
+            format!(
+                "{}の設定は変更済みのため、そのままにしました",
+                service.name()
+            )
+        });
+        Ok(())
     }
 
     /// Keep registrations pointing at this executable after the app moves or is renamed.
@@ -1291,83 +1305,6 @@ impl Widget {
         }
         if changed {
             self.persist();
-        }
-    }
-
-    fn codex_settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Codexとの接続").strong());
-        ui.label(
-            RichText::new(match &self.installation {
-                Some(installation) if installation.is_app => "Codexアプリを検出しました",
-                Some(_) => "Codex CLIを検出しました",
-                None if self.worker.is_some() => "Codexを探しています…",
-                None => "CodexアプリまたはCLIが必要です",
-            })
-            .size(12.0)
-            .color(MUTED),
-        );
-        if let Some(installation) = &self.installation {
-            let path = &installation.path;
-            ui.add(
-                egui::Label::new(
-                    RichText::new(path.to_string_lossy())
-                        .size(10.0)
-                        .color(MUTED),
-                )
-                .truncate(),
-            )
-            .on_hover_text(path.to_string_lossy());
-        }
-        ui.add_enabled_ui(self.worker.is_none(), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("場所を選択").clicked() {
-                    let dialog = rfd::FileDialog::new().set_title("公式Codexの実行ファイルを選択");
-                    #[cfg(windows)]
-                    let dialog = dialog.add_filter("Codex", &["exe", "cmd"]);
-                    if let Some(path) = dialog.pick_file() {
-                        self.settings.codex_path = Some(path);
-                        self.reset_connection(ui.ctx());
-                    }
-                }
-                if ui.button("自動検出").clicked() {
-                    self.settings.codex_path = None;
-                    self.reset_connection(ui.ctx());
-                }
-            });
-        });
-        ui.add_space(5.0);
-        ui.label(
-            RichText::new(
-                "公式CodexのアプリまたはCLIに、ChatGPTアカウントでログインしてください。",
-            )
-            .size(11.0)
-            .color(MUTED),
-        );
-        ui.hyperlink_to(
-            "公式の導入・ログイン手順",
-            "https://learn.chatgpt.com/docs/quickstart?setup=app",
-        );
-        if let Some(account) = &self.account {
-            ui.add_space(5.0);
-            if let Some(email) = &account.email {
-                ui.add(egui::Label::new(RichText::new(email).size(11.0)).truncate());
-            }
-            if let Some(plan) = &account.plan {
-                ui.label(
-                    RichText::new(format!("プラン：{plan}"))
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            }
-        }
-        if ui
-            .add_enabled(self.worker.is_none(), egui::Button::new("接続を確認"))
-            .clicked()
-        {
-            self.refresh(ui.ctx(), false);
-        }
-        if let Some(error) = &self.error {
-            ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
         }
     }
 }
@@ -1474,7 +1411,7 @@ impl eframe::App for Widget {
             self.started = true;
             self.relink();
             if self.settings.first_run {
-                self.first_run(ctx);
+                self.first_run();
             }
         }
         self.sync_watcher(ctx);
@@ -1583,6 +1520,37 @@ fn reset_label(timestamp: i64) -> String {
                 date.format("%H:%M")
             )
         })
+}
+
+fn move_up_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "上へ"));
+    let color = if response.hovered() {
+        FOREGROUND
+    } else {
+        MUTED
+    };
+    let center = rect.center();
+    ui.painter().add(egui::Shape::line(
+        vec![
+            center + vec2(-4.0, 2.0),
+            center + vec2(0.0, -2.0),
+            center + vec2(4.0, 2.0),
+        ],
+        Stroke::new(1.3, color),
+    ));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Codex reports plan ids such as "plus"; Pro tiers share one name.
+fn plan_name(plan: &str) -> String {
+    if plan.starts_with("pro") {
+        return "Pro".into();
+    }
+    let mut letters = plan.chars();
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
 }
 
 /// A time of day, with the date when it is not today.
@@ -2017,13 +1985,26 @@ mod tests {
         assert_eq!(widget.size.x, WIDTH);
         assert!(widget.size.y >= HEIGHT);
         let output = step(&mut widget, vec![]);
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size);
+        let mut texts = Vec::new();
         for shape in &output.shapes {
             if let egui::Shape::Text(text) = &shape.shape {
-                assert!(
-                    !["設定", "戻る", "最前面に表示", "ログイン時に自動起動"]
-                        .contains(&text.galley.job.text.as_str())
-                );
+                assert!(bounds.contains_rect(shape.shape.visual_bounding_rect()));
+                texts.push(text.galley.job.text.clone());
             }
+        }
+        // The settings list every service; the menu stays closed.
+        for wanted in [
+            "設定",
+            "表示するサービス",
+            "Codex",
+            "Claude Code",
+            "Antigravity CLI（実験的）",
+        ] {
+            assert!(texts.iter().any(|text| text == wanted), "{wanted}");
+        }
+        for menu in ["最前面に表示", "ログイン時に自動起動", "終了"] {
+            assert!(!texts.iter().any(|text| text == menu), "{menu}");
         }
         output.drop_without_applying_deltas();
         widget.settings_open = false;

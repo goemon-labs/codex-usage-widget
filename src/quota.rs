@@ -59,6 +59,24 @@ impl Span {
     }
 }
 
+/// A whole amount with thousands separators, such as "62,500".
+pub fn amount_label(value: f64) -> String {
+    let rounded = value.round() as i64;
+    let digits = rounded.unsigned_abs().to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if rounded < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
 /// A remaining percentage, rounded down so the widget never promises more than is left.
 pub fn percent_label(remaining: Option<f64>) -> String {
     match remaining {
@@ -278,6 +296,19 @@ mod tests {
         assert!(Span::Minutes(10500).is_weekly());
         assert!(!Span::Minutes(43200).is_weekly());
         assert_eq!(Span::Unknown.label(), "利用枠");
+    }
+
+    #[test]
+    fn amounts_are_whole_numbers_with_separators() {
+        for (value, expected) in [
+            (62_500.371_234, "62,500"),
+            (999.5, "1,000"),
+            (1_234_567.0, "1,234,567"),
+            (12.0, "12"),
+            (-1_500.0, "-1,500"),
+        ] {
+            assert_eq!(amount_label(value), expected);
+        }
     }
 
     #[test]
