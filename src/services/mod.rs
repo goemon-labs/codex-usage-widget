@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod codex_app;
@@ -6,6 +7,7 @@ use crate::quota::Snapshot;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,15 +15,18 @@ pub enum ServiceId {
     Codex,
     #[serde(rename = "claude")]
     ClaudeCode,
+    #[serde(rename = "antigravity")]
+    AntigravityCli,
 }
 
 impl ServiceId {
-    pub const ALL: [Self; 2] = [Self::Codex, Self::ClaudeCode];
+    pub const ALL: [Self; 3] = [Self::Codex, Self::ClaudeCode, Self::AntigravityCli];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude Code",
+            Self::AntigravityCli => "Antigravity CLI",
         }
     }
 
@@ -30,6 +35,7 @@ impl ServiceId {
         match self {
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude",
+            Self::AntigravityCli => "Antigravity",
         }
     }
 
@@ -38,6 +44,7 @@ impl ServiceId {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude",
+            Self::AntigravityCli => "antigravity",
         }
     }
 
@@ -50,11 +57,27 @@ impl ServiceId {
         self != Self::Codex
     }
 
+    /// Supported on a best-effort basis until its status line data is confirmed on real accounts.
+    pub fn experimental(self) -> bool {
+        self == Self::AntigravityCli
+    }
+
+    /// Where the service's tool keeps its settings, including its status line command.
+    pub fn config_dir(self) -> Option<PathBuf> {
+        match self {
+            Self::Codex => None,
+            Self::ClaudeCode => claude::config_dir(),
+            Self::AntigravityCli => antigravity::config_dir(),
+        }
+    }
+
     /// Whether the service seems to be installed; only checks that its files exist.
     pub fn detected(self) -> bool {
         match self {
             Self::Codex => codex::find_codex(None).is_some(),
-            Self::ClaudeCode => claude::config_dir().is_some_and(|directory| directory.is_dir()),
+            _ => self
+                .config_dir()
+                .is_some_and(|directory| directory.is_dir()),
         }
     }
 }
@@ -64,6 +87,7 @@ pub fn extract(service: ServiceId, payload: &Value) -> Option<Value> {
     match service {
         ServiceId::Codex => None,
         ServiceId::ClaudeCode => claude::extract(payload),
+        ServiceId::AntigravityCli => antigravity::extract(payload),
     }
 }
 
@@ -77,5 +101,6 @@ pub fn received_snapshot(
     match service {
         ServiceId::Codex => None,
         ServiceId::ClaudeCode => Some(claude::snapshot(data, received_at, now)),
+        ServiceId::AntigravityCli => Some(antigravity::snapshot(data, received_at, now)),
     }
 }

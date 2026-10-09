@@ -2,7 +2,7 @@
 //! and the widget keeps only the usage numbers for its own display.
 use crate::{
     process::ProcessGuard,
-    services::{self, ServiceId, claude},
+    services::{self, ServiceId, antigravity, claude},
     settings::{self, Bridge, Settings},
 };
 use chrono::Local;
@@ -44,6 +44,8 @@ pub fn run(key: &str) -> i32 {
         .map(String::from);
     let output = match previous {
         Some(command) => run_previous(&command, &input).unwrap_or_default(),
+        // Antigravity CLI keeps its own line, which already shows the quota.
+        None if service == ServiceId::AntigravityCli => Vec::new(),
         None => summary(service, data.as_ref()).into_bytes(),
     };
     let mut stdout = io::stdout().lock();
@@ -120,6 +122,7 @@ pub fn tool_settings(service: ServiceId) -> Option<PathBuf> {
     match service {
         ServiceId::Codex => None,
         ServiceId::ClaudeCode => claude::settings_path(),
+        ServiceId::AntigravityCli => antigravity::settings_path(),
     }
 }
 
@@ -146,7 +149,7 @@ pub fn link(service: ServiceId, existing: Option<&Bridge>) -> Result<Bridge, Str
         Some(bytes) => serde_json::from_slice(bytes).map_err(|_| UNREADABLE)?,
         None => json!({}),
     };
-    let replaced = install(&mut value, &command)?;
+    let replaced = install(&mut value, &command, service == ServiceId::AntigravityCli)?;
     // Linking again keeps the setting from before the first link.
     let previous = match (replaced, existing) {
         (Some(line), Some(bridge)) if line_command(&line) == Some(bridge.command.as_str()) => {
@@ -204,8 +207,9 @@ fn line_command(line: &Value) -> Option<&str> {
     line.get("command")?.as_str()
 }
 
-/// Replace the status line command, returning the setting it replaced.
-fn install(settings: &mut Value, command: &str) -> Result<Option<Value>, String> {
+/// Replace the status line command, returning the setting it replaced. `stacked` tools can
+/// show a command below their built-in line, which then stays when there was no custom line.
+fn install(settings: &mut Value, command: &str, stacked: bool) -> Result<Option<Value>, String> {
     let object = settings.as_object_mut().ok_or(UNREADABLE)?;
     let previous = object.get("statusLine").cloned();
     // Keep the user's spacing and refresh options; only the command changes.
@@ -216,6 +220,12 @@ fn install(settings: &mut Value, command: &str) -> Result<Option<Value>, String>
         .unwrap_or_default();
     line.insert("type".into(), "command".into());
     line.insert("command".into(), command.into());
+    if stacked {
+        line.insert("enabled".into(), true.into());
+        if previous.is_none() {
+            line.insert("stack_with_default".into(), true.into());
+        }
+    }
     object.insert("statusLine".into(), Value::Object(line));
     Ok(previous)
 }
@@ -428,7 +438,7 @@ mod tests {
             "theme": "dark"
         });
         let mut settings = original.clone();
-        let previous = install(&mut settings, "widget statusline claude").unwrap();
+        let previous = install(&mut settings, "widget statusline claude", false).unwrap();
         assert_eq!(previous, Some(original["statusLine"].clone()));
         assert_eq!(
             settings["statusLine"],
@@ -449,7 +459,7 @@ mod tests {
     #[test]
     fn unlinking_without_a_previous_line_removes_it_and_respects_user_changes() {
         let mut settings = json!({"a": 1, "b": 2});
-        let previous = install(&mut settings, "widget statusline claude").unwrap();
+        let previous = install(&mut settings, "widget statusline claude", false).unwrap();
         assert!(previous.is_none());
         let bridge = Bridge {
             command: "widget statusline claude".into(),
@@ -465,7 +475,29 @@ mod tests {
             serde_json::to_string(&settings).unwrap(),
             r#"{"a":1,"b":2}"#
         );
-        assert!(install(&mut json!([]), "x").is_err());
+        assert!(install(&mut json!([]), "x", false).is_err());
+    }
+
+    #[test]
+    fn stacked_status_lines_keep_the_built_in_line_only_when_there_was_no_custom_one() {
+        let mut fresh = json!({});
+        assert!(
+            install(&mut fresh, "w statusline antigravity", true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fresh["statusLine"],
+            json!({"type": "command", "command": "w statusline antigravity",
+                "enabled": true, "stack_with_default": true})
+        );
+        let mut custom = json!({"statusLine": {"type": "command", "command": "~/line.sh",
+            "enabled": false}});
+        install(&mut custom, "w statusline antigravity", true).unwrap();
+        assert_eq!(
+            custom["statusLine"],
+            json!({"type": "command", "command": "w statusline antigravity", "enabled": true})
+        );
     }
 
     #[test]

@@ -1117,8 +1117,13 @@ impl Widget {
                 let mut shown = position.is_some();
                 // At least one service stays selected.
                 let locked = shown && self.settings.services.len() == 1;
+                let label = if service.experimental() {
+                    format!("{}（実験的）", service.name())
+                } else {
+                    service.name().into()
+                };
                 if ui
-                    .add_enabled(!locked, egui::Checkbox::new(&mut shown, service.name()))
+                    .add_enabled(!locked, egui::Checkbox::new(&mut shown, label))
                     .changed()
                 {
                     if shown {
@@ -1181,12 +1186,19 @@ impl Widget {
         let file = bridge::tool_settings(service)
             .map_or_else(String::new, |path| path.display().to_string());
         if self.confirm_link == Some(service) {
+            // Antigravity CLI keeps its built-in line; Claude Code shows the widget's summary.
+            let shown = if service == ServiceId::AntigravityCli {
+                "これまでの表示はそのまま残ります。実験的な機能です。".to_string()
+            } else {
+                format!(
+                    "ステータスラインを使っていない場合は、{}の画面下部に残量が表示されます。",
+                    service.name()
+                )
+            };
             ui.label(
                 RichText::new(format!(
                     "{}の設定ファイル（{file}）のステータスラインに、残量を受け取るコマンドを登録します。\
-                     いまのステータスラインは表示されたまま残り、解除すると元の設定に戻ります。\
-                     ステータスラインを使っていない場合は、{}の画面下部に残量が表示されます。",
-                    service.name(),
+                     いまのステータスラインは表示されたまま残り、解除すると元の設定に戻ります。{shown}",
                     service.name()
                 ))
                 .size(11.0),
