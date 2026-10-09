@@ -1,6 +1,8 @@
+mod card;
+
 use crate::{
     platform::{self, Action},
-    quota::{Snapshot, Window},
+    quota::Snapshot,
     services::codex::{self, Account, ErrorKind, FetchError},
     settings::Settings,
 };
@@ -28,6 +30,7 @@ const BACKGROUND: Color32 = Color32::from_rgb(20, 24, 29);
 const FOREGROUND: Color32 = Color32::from_rgb(233, 239, 242);
 const MUTED: Color32 = Color32::from_rgb(145, 157, 168);
 const GREEN: Color32 = Color32::from_rgb(101, 220, 173);
+const AMBER: Color32 = Color32::from_rgb(225, 180, 107);
 const BORDER: Color32 = Color32::from_rgb(45, 53, 61);
 
 pub fn window_size(bar_mode: bool) -> egui::Vec2 {
@@ -239,20 +242,12 @@ impl Widget {
                                     .next_reset(now)
                                     .map_or(now + 300, |reset| reset.min(now + 300)),
                             );
+                            self.usage = Some(usage);
                             if let Some(tray) = &self.tray {
-                                let text = usage.main_window().map_or(
-                                    "利用枠を確認中".into(),
-                                    |window| {
-                                        format!(
-                                            "{}の残り {}",
-                                            window.label(),
-                                            window.remaining_label()
-                                        )
-                                    },
-                                );
+                                let hero = card::hero(self.usage.as_ref(), &self.source(), now);
+                                let text = card::bar_text(&hero);
                                 let _ = tray.set_tooltip(Some(format!("Codex · {text}")));
                             }
-                            self.usage = Some(usage);
                         }
                         Err(error) => {
                             self.failures = self.failures.saturating_add(1);
@@ -418,22 +413,32 @@ impl Widget {
         self.menu_open = open;
     }
 
+    fn source(&self) -> card::Source {
+        card::Source {
+            name: "Codex",
+            received: false,
+            loading: self.worker.is_some() && self.usage.is_none(),
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui, compact: bool) {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
-            let weekly = self.usage.as_ref().and_then(Snapshot::main_window);
-            let current = weekly.filter(|window| !window.expired(Local::now().timestamp()));
-            let dot = if compact && self.error.is_some() {
-                Color32::from_rgb(225, 180, 107)
-            } else if compact && current.and_then(|window| window.remaining).is_none() {
+            let hero = card::hero(
+                self.usage.as_ref(),
+                &self.source(),
+                Local::now().timestamp(),
+            );
+            let dot = if hero.blocked || (compact && self.error.is_some()) {
+                AMBER
+            } else if compact && hero.fraction.is_none() {
                 MUTED
             } else {
                 GREEN
             };
             ui.painter().circle_filled(rect.center(), 2.5, dot);
             if compact {
-                let remaining = current.map_or("—".into(), Window::remaining_label);
-                ui.label(RichText::new(format!("週次の残り {remaining}")).size(13.0));
+                ui.label(RichText::new(card::bar_text(&hero)).size(13.0));
             } else {
                 ui.label(RichText::new("Codex").size(14.0).strong());
             }
@@ -449,45 +454,7 @@ impl Widget {
 
     fn usage_ui(&mut self, ui: &mut egui::Ui) {
         let now = Local::now().timestamp();
-        ui.add_space(17.0);
-        ui.label(RichText::new("週次の残り").size(11.0).color(MUTED));
-        ui.add_space(1.0);
-        let weekly = self.usage.as_ref().and_then(Snapshot::main_window);
-        let expired = weekly.is_some_and(|window| window.expired(now));
-        let label = if expired {
-            "—".into()
-        } else {
-            weekly.map_or("—".into(), Window::remaining_label)
-        };
-        ui.label(RichText::new(label).size(32.0).color(FOREGROUND));
-        ui.add_space(7.0);
-        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
-        ui.painter().rect_filled(bar, 2.0, BORDER);
-        if !expired && let Some(remaining) = weekly.and_then(|window| window.remaining) {
-            let filled = egui::Rect::from_min_size(
-                bar.min,
-                vec2(bar.width() * remaining as f32 / 100.0, bar.height()),
-            );
-            if remaining > 0.0 {
-                ui.painter().rect_filled(filled, 2.0, GREEN);
-            }
-        }
-        ui.add_space(12.0);
-        ui.label(RichText::new("リセット").size(11.0).color(MUTED));
-        let reset = if expired {
-            "リセット後の情報を確認中".into()
-        } else if let Some(reset) = weekly.and_then(|window| window.resets_at) {
-            reset_label(reset)
-        } else if self.worker.is_some() && self.usage.is_none() {
-            "取得中…".into()
-        } else if weekly.is_some() {
-            "リセット日時を確認できませんでした".into()
-        } else if self.usage.is_some() {
-            "週次の情報を取得できませんでした".into()
-        } else {
-            "Codexの利用枠を確認します".into()
-        };
-        ui.label(RichText::new(reset).size(12.0));
+        card::hero_ui(ui, &card::hero(self.usage.as_ref(), &self.source(), now));
         // Only some plans earn reset credits; keep the row in place until the first response.
         if self
             .usage
@@ -497,36 +464,13 @@ impl Widget {
             ui.add_space(21.0);
             self.reset_credits_ui(ui, now);
         }
-
-        let short = self.usage.as_ref().and_then(|usage| {
-            let main = usage.main_window()?;
-            usage.groups[0]
-                .windows
-                .iter()
-                .find(|window| !std::ptr::eq(*window, main))
-        });
-        if let Some(short) = short {
-            ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{}の残り", short.label()))
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(if short.expired(now) {
-                            "確認中".into()
-                        } else {
-                            short.remaining_label()
-                        })
-                        .size(12.0),
-                    );
-                });
-            });
-            if let Some(reset) = short.resets_at {
-                ui.label(RichText::new(reset_label(reset)).size(11.0).color(MUTED));
-            }
+        let lines = self
+            .usage
+            .as_ref()
+            .map_or_else(Vec::new, |usage| card::lines(usage, false, now));
+        for (index, line) in lines.iter().enumerate() {
+            ui.add_space(if index == 0 { 18.0 } else { 12.0 });
+            card::line_ui(ui, line);
         }
         if let Some(error) = &self.error {
             ui.add_space(15.0);
@@ -1104,6 +1048,86 @@ mod tests {
     }
 
     #[test]
+    fn countdown_and_credit_cards_fit_inside_the_card() {
+        use crate::quota::{Blocked, Cap, Group, Span, Window};
+        let ctx = egui::Context::default();
+        let mut widget = std::mem::ManuallyDrop::new(Widget::new(&ctx, Settings::default()));
+        let now = Local::now().timestamp();
+        let blocked = Snapshot {
+            groups: vec![Group::new(
+                None,
+                vec![
+                    Window {
+                        span: Span::Minutes(300),
+                        remaining: Some(0.0),
+                        resets_at: Some(now + 23 * 3600 + 59 * 60),
+                    },
+                    Window {
+                        span: Span::Minutes(10080),
+                        remaining: Some(54.0),
+                        resets_at: Some(now + 86_400),
+                    },
+                ],
+            )],
+            cap: None,
+            balance: None,
+            reset_credits: None,
+            blocked: Some(Blocked {
+                label: "5時間の枠".into(),
+                until: Some(now + 23 * 3600 + 59 * 60),
+                minutes: Some(300),
+            }),
+            observed_at: Local::now(),
+        };
+        let credit = Snapshot {
+            groups: vec![Group::default()],
+            cap: Some(Cap {
+                label: "月間クレジット上限".into(),
+                remaining: Some(62.0),
+                detail: Some("314 / 500 クレジット使用".into()),
+                resets_at: Some(now + 86_400),
+            }),
+            balance: Some("1250".into()),
+            reset_credits: None,
+            blocked: None,
+            observed_at: Local::now(),
+        };
+        for (usage, expected) in [
+            (blocked, "あと 23時間59分"),
+            (credit, "月間クレジット上限の残り"),
+        ] {
+            widget.usage = Some(usage);
+            widget.last_started = Some(Instant::now());
+            let mut found = false;
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size)),
+                        focused: true,
+                        ..Default::default()
+                    },
+                    |ui| widget.render(ui),
+                );
+                let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size);
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        assert!(
+                            bounds.contains_rect(shape.shape.visual_bounding_rect()),
+                            "{}",
+                            text.galley.job.text
+                        );
+                        found |= text.galley.job.text == expected;
+                    }
+                }
+                output.drop_without_applying_deltas();
+            }
+            assert!(found, "{expected}");
+            assert_eq!(widget.size.x, WIDTH);
+        }
+        assert!(widget.worker.is_none());
+    }
+
+    #[test]
     fn bar_stays_one_line_with_a_clickable_menu_and_returns_from_settings() {
         let ctx = egui::Context::default();
         let mut widget = std::mem::ManuallyDrop::new(Widget::new(
@@ -1129,7 +1153,7 @@ mod tests {
             widget.usage = Some(Snapshot {
                 groups: vec![crate::quota::Group::new(
                     None,
-                    vec![Window {
+                    vec![crate::quota::Window {
                         span: crate::quota::Span::Minutes(10080),
                         remaining,
                         resets_at: None,

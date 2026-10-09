@@ -59,6 +59,15 @@ impl Span {
     }
 }
 
+/// A remaining percentage, rounded down so the widget never promises more than is left.
+pub fn percent_label(remaining: Option<f64>) -> String {
+    match remaining {
+        Some(value) if value > 0.0 && value < 1.0 => "1%未満".into(),
+        Some(value) => format!("{}%", value.floor() as u32),
+        None => "—".into(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Window {
     pub span: Span,
@@ -72,11 +81,7 @@ impl Window {
     }
 
     pub fn remaining_label(&self) -> String {
-        match self.remaining {
-            Some(value) if value > 0.0 && value < 1.0 => "1%未満".into(),
-            Some(value) => format!("{}%", value.floor() as u32),
-            None => "—".into(),
-        }
+        percent_label(self.remaining)
     }
 
     pub fn expired(&self, now: i64) -> bool {
