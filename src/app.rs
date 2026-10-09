@@ -8,7 +8,7 @@ use crate::{
         self, ServiceId,
         codex::{self, Account, ErrorKind, FetchError},
     },
-    settings::Settings,
+    settings::{self, Settings},
 };
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use eframe::egui::{
@@ -31,6 +31,8 @@ pub const WIDTH: f32 = 252.0;
 pub const HEIGHT: f32 = 320.0;
 const BAR_WIDTH: f32 = 212.0;
 const BAR_HEIGHT: f32 = 40.0;
+/// Size of a service icon in the bar, matching its 13px text.
+const ICON: f32 = 14.0;
 const MENU_SPACE: f32 = 208.0;
 const BACKGROUND: Color32 = Color32::from_rgb(20, 24, 29);
 const FOREGROUND: Color32 = Color32::from_rgb(233, 239, 242);
@@ -134,6 +136,8 @@ pub struct Widget {
     failed_link: Option<ServiceId>,
     /// The service opened from the combined view.
     detail: Option<ServiceId>,
+    /// Logos the user placed in the icons folder, shown in the bar instead of names.
+    icons: BTreeMap<ServiceId, egui::TextureHandle>,
     /// Services found on the first launch, waiting for the user to pick what to show.
     choices: Option<Vec<ServiceId>>,
     started: bool,
@@ -209,6 +213,7 @@ impl Widget {
             watcher: None,
             failed_link: None,
             detail: None,
+            icons: BTreeMap::new(),
             choices: None,
             started: false,
             fetch_tx,
@@ -563,26 +568,84 @@ impl Widget {
             .collect()
     }
 
-    fn bar_text(&self, now: i64) -> String {
+    /// What the bar shows for each service: its icon or name, then what is left.
+    fn bar_items(&self, now: i64) -> Vec<(Option<egui::TextureId>, String)> {
         match self.heroes(now).as_slice() {
-            [(_, hero)] => card::bar_text(hero),
+            [(_, hero)] => vec![(None, card::bar_text(hero))],
             heroes => heroes
                 .iter()
-                .map(|(service, hero)| format!("{} {}", service.short_name(), hero.short_value))
-                .collect::<Vec<_>>()
-                .join("・"),
+                .map(|(service, hero)| match self.icons.get(service) {
+                    Some(icon) => (Some(icon.id()), hero.short_value.clone()),
+                    None => (
+                        None,
+                        format!("{} {}", service.short_name(), hero.short_value),
+                    ),
+                })
+                .collect(),
         }
     }
 
     /// The bar grows to fit every selected service.
     fn bar_width(&self, ui: &egui::Ui) -> f32 {
-        let text = ui.painter().layout_no_wrap(
-            self.bar_text(Local::now().timestamp()),
-            egui::FontId::proportional(13.0),
-            FOREGROUND,
-        );
-        // The status dot, gaps, menu button and margins around the text.
-        (text.size().x + 88.0).ceil().max(BAR_WIDTH)
+        let items = self.bar_items(Local::now().timestamp());
+        let content: f32 = items
+            .iter()
+            .map(|(icon, text)| {
+                let text = ui
+                    .painter()
+                    .layout_no_wrap(text.clone(), egui::FontId::proportional(13.0), FOREGROUND)
+                    .size()
+                    .x;
+                text + if icon.is_some() { ICON + 4.0 } else { 0.0 }
+            })
+            .sum::<f32>()
+            + 12.0 * items.len().saturating_sub(1) as f32;
+        // The status dot, gaps, menu button and margins around the content.
+        (content + 88.0).ceil().max(BAR_WIDTH)
+    }
+
+    fn bar_ui(&self, ui: &mut egui::Ui, now: i64) {
+        for (index, (icon, text)) in self.bar_items(now).into_iter().enumerate() {
+            if index > 0 {
+                ui.add_space(4.0);
+            }
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if let Some(icon) = icon {
+                    ui.add(egui::Image::new((icon, vec2(ICON, ICON))));
+                }
+                ui.label(RichText::new(text).size(13.0));
+            });
+        }
+    }
+
+    /// Load the logos the user placed in the icons folder; missing ones fall back to names.
+    fn load_icons(&mut self, ctx: &egui::Context) {
+        let Some(directory) = settings::icons_dir() else {
+            return;
+        };
+        for service in ServiceId::ALL {
+            let Ok(bytes) = fs::read(directory.join(format!("{}.png", service.key()))) else {
+                continue;
+            };
+            // Keep the texture small enough for any GPU; icons are drawn at 14px anyway.
+            let Some(icon) = eframe::icon_data::from_png_bytes(&bytes)
+                .ok()
+                .filter(|icon| icon.width <= 1024 && icon.height <= 1024)
+            else {
+                continue;
+            };
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            let texture = ctx.load_texture(
+                format!("icon-{}", service.key()),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.icons.insert(service, texture);
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui, compact: bool) {
@@ -605,7 +668,7 @@ impl Widget {
                 ui.painter().circle_filled(rect.center(), 2.5, dot);
             }
             if compact {
-                ui.label(RichText::new(self.bar_text(now)).size(13.0));
+                self.bar_ui(ui, now);
             } else {
                 let title = if self.settings_open {
                     "設定"
@@ -1376,6 +1439,7 @@ impl eframe::App for Widget {
         if !self.started {
             self.started = true;
             self.relink();
+            self.load_icons(ctx);
             if self.settings.first_run {
                 self.first_run();
             }
@@ -1819,7 +1883,17 @@ mod tests {
         texts(&mut widget);
         let bar = texts(&mut widget);
         let line: Vec<_> = bar.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(line, ["Codex 62%・Claude あと2:13", "⋯"]);
+        assert_eq!(line, ["Codex 62%", "Claude あと2:13", "⋯"]);
+        // Logos the user provides take the place of the names.
+        for service in [ServiceId::Codex, ServiceId::ClaudeCode] {
+            let image = egui::ColorImage::filled([2, 2], Color32::WHITE);
+            let texture = ctx.load_texture(service.key(), image, egui::TextureOptions::LINEAR);
+            widget.icons.insert(service, texture);
+        }
+        texts(&mut widget);
+        let bar = texts(&mut widget);
+        let line: Vec<_> = bar.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(line, ["62%", "あと2:13", "⋯"]);
         assert!(widget.size.x > BAR_WIDTH);
         assert!(widget.worker.is_none());
     }

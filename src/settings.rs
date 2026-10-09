@@ -58,6 +58,11 @@ pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("", "", "codex-usage-widget")
 }
 
+/// Service icons the user provides, such as `claude.png`; the app does not bundle any logos.
+pub fn icons_dir() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.config_dir().join("icons"))
+}
+
 impl Settings {
     fn path() -> io::Result<PathBuf> {
         project_dirs()
