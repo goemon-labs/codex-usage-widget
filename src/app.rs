@@ -135,6 +135,10 @@ pub struct Widget {
     watcher: Option<Watcher>,
     /// A status line registration waiting for the user to confirm it.
     confirm_link: Option<ServiceId>,
+    /// The service opened from the combined view.
+    detail: Option<ServiceId>,
+    /// Services found on the first launch, waiting for the user to pick what to show.
+    choices: Option<Vec<ServiceId>>,
     started: bool,
     fetch_tx: Sender<FetchEvent>,
     fetch_rx: Receiver<FetchEvent>,
@@ -208,6 +212,8 @@ impl Widget {
             worker: None,
             watcher: None,
             confirm_link: None,
+            detail: None,
+            choices: None,
             started: false,
             fetch_tx,
             fetch_rx,
@@ -307,7 +313,11 @@ impl Widget {
     }
 
     fn refresh(&mut self, ctx: &egui::Context, changed_configuration: bool) {
-        if self.worker.is_some() || !self.shows(ServiceId::Codex) {
+        if !self.shows(ServiceId::Codex) {
+            self.next_refresh = None;
+            return;
+        }
+        if self.worker.is_some() {
             return;
         }
         if !changed_configuration && let Some(started) = self.last_started {
@@ -541,33 +551,71 @@ impl Widget {
         self.menu_open = open;
     }
 
-    /// The service shown on its own when only one is selected.
-    fn primary(&self) -> ServiceId {
-        self.settings.services[0]
+    /// The service whose card is shown, or `None` for the combined view.
+    fn shown(&self) -> Option<ServiceId> {
+        match self.settings.services.as_slice() {
+            [only] => Some(*only),
+            _ => self.detail,
+        }
+    }
+
+    fn heroes(&self, now: i64) -> Vec<(ServiceId, card::Hero)> {
+        self.settings
+            .services
+            .iter()
+            .map(|&service| {
+                let hero = card::hero(self.snapshot(service), &self.source(service), now);
+                (service, hero)
+            })
+            .collect()
+    }
+
+    fn bar_text(&self, now: i64) -> String {
+        match self.heroes(now).as_slice() {
+            [(_, hero)] => card::bar_text(hero),
+            heroes => heroes
+                .iter()
+                .map(|(service, hero)| format!("{} {}", service.short_name(), hero.short_value))
+                .collect::<Vec<_>>()
+                .join("・"),
+        }
+    }
+
+    /// The bar grows to fit every selected service.
+    fn bar_width(&self, ui: &egui::Ui) -> f32 {
+        let text = ui.painter().layout_no_wrap(
+            self.bar_text(Local::now().timestamp()),
+            egui::FontId::proportional(13.0),
+            FOREGROUND,
+        );
+        // The status dot, gaps, menu button and margins around the text.
+        (text.size().x + 88.0).ceil().max(BAR_WIDTH)
     }
 
     fn header(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let service = self.primary();
+        let now = Local::now().timestamp();
+        let heroes = self.heroes(now);
+        let shown = self.shown();
         ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
-            let hero = card::hero(
-                self.snapshot(service),
-                &self.source(service),
-                Local::now().timestamp(),
-            );
-            let failed = service == ServiceId::Codex && self.error.is_some();
-            let dot = if hero.blocked || (compact && failed) {
-                AMBER
-            } else if compact && hero.fraction.is_none() {
-                MUTED
+            if !compact && !self.settings_open && self.detail.is_some() && shown.is_some() {
+                self.back_button(ui);
             } else {
-                GREEN
-            };
-            ui.painter().circle_filled(rect.center(), 2.5, dot);
+                let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
+                let failed = self.shows(ServiceId::Codex) && self.error.is_some();
+                let dot = if heroes.iter().any(|(_, hero)| hero.blocked) || (compact && failed) {
+                    AMBER
+                } else if compact && heroes.iter().all(|(_, hero)| hero.fraction.is_none()) {
+                    MUTED
+                } else {
+                    GREEN
+                };
+                ui.painter().circle_filled(rect.center(), 2.5, dot);
+            }
             if compact {
-                ui.label(RichText::new(card::bar_text(&hero)).size(13.0));
+                ui.label(RichText::new(self.bar_text(now)).size(13.0));
             } else {
-                ui.label(RichText::new(service.name()).size(14.0).strong());
+                let title = shown.map_or("利用状況", ServiceId::name);
+                ui.label(RichText::new(title).size(14.0).strong());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.scope(|ui| {
@@ -577,6 +625,187 @@ impl Widget {
                 });
             });
         });
+    }
+
+    fn back_button(&mut self, ui: &mut egui::Ui) {
+        let (rect, response) = ui.allocate_exact_size(vec2(14.0, 24.0), Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "まとめ表示に戻る")
+        });
+        let color = if response.hovered() {
+            FOREGROUND
+        } else {
+            MUTED
+        };
+        let center = rect.center();
+        ui.painter().add(egui::Shape::line(
+            vec![
+                center + vec2(2.5, -5.0),
+                center + vec2(-2.5, 0.0),
+                center + vec2(2.5, 5.0),
+            ],
+            Stroke::new(1.4, color),
+        ));
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.detail = None;
+        }
+    }
+
+    /// Every selected service in one card, each in its own section.
+    fn combined_ui(&mut self, ui: &mut egui::Ui) {
+        let now = Local::now().timestamp();
+        for (index, service) in self.settings.services.clone().into_iter().enumerate() {
+            ui.add_space(if index == 0 { 14.0 } else { 12.0 });
+            self.section_header(ui, service);
+            let source = self.source(service);
+            let (rows, resets, empty) = match self.snapshot(service) {
+                Some(snapshot) => (
+                    card::rows(snapshot, source.received, now),
+                    snapshot
+                        .reset_credits
+                        .as_ref()
+                        .map(|resets| resets.available_count),
+                    "利用枠の情報を取得できませんでした".into(),
+                ),
+                None => (Vec::new(), None, card::hero(None, &source, now).when),
+            };
+            for row in &rows {
+                card::row_ui(ui, row);
+            }
+            if rows.is_empty() {
+                ui.label(RichText::new(empty).size(11.0).color(MUTED));
+            }
+            if let Some(count) = resets {
+                ui.label(
+                    RichText::new(format!("リセット権 {count}枚"))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            }
+            if service == ServiceId::Codex
+                && let Some(error) = &self.error
+            {
+                ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
+            } else if service.received() && !self.settings.bridges.contains_key(&service) {
+                ui.label(
+                    RichText::new(format!("{}と連携すると表示されます。", service.name()))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            }
+        }
+        let used_height = ui.cursor().top() - ui.min_rect().top();
+        ui.add_space((HEIGHT - 42.0 - used_height - 24.0).max(16.0));
+        if self.shows(ServiceId::Codex) {
+            self.footer_ui(ui, ServiceId::Codex);
+        } else {
+            ui.label(
+                RichText::new("各サービスの利用時に更新")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        }
+    }
+
+    /// The service name opens its own card; received services also say when they last reported.
+    fn section_header(&mut self, ui: &mut egui::Ui, service: ServiceId) {
+        let status = self
+            .snapshot(service)
+            .filter(|_| service.received())
+            .map(|snapshot| format!("受信 {}", time_label(snapshot.observed_at)));
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("{}の詳細", service.name()),
+            )
+        });
+        let painter = ui.painter();
+        painter.text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            service.name(),
+            egui::FontId::proportional(13.0),
+            FOREGROUND,
+        );
+        if let Some(status) = status {
+            painter.text(
+                rect.right_center() - vec2(14.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                status,
+                egui::FontId::proportional(10.0),
+                MUTED,
+            );
+        }
+        let color = if response.hovered() {
+            FOREGROUND
+        } else {
+            MUTED
+        };
+        let center = rect.right_center() - vec2(4.0, 0.0);
+        painter.add(egui::Shape::line(
+            vec![
+                center + vec2(-1.5, -3.0),
+                center + vec2(1.5, 0.0),
+                center + vec2(-1.5, 3.0),
+            ],
+            Stroke::new(1.2, color),
+        ));
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.detail = Some(service);
+        }
+    }
+
+    /// Shown on the first launch when more than one service is installed.
+    fn choose_ui(&mut self, ui: &mut egui::Ui, choices: Vec<ServiceId>) {
+        ui.add_space(17.0);
+        ui.label(RichText::new("表示するサービスを選んでください").size(13.0));
+        ui.add_space(6.0);
+        let mut chosen = None;
+        for &service in &choices {
+            if ui.button(service.name()).clicked() {
+                chosen = Some(vec![service]);
+            }
+        }
+        if ui.button("まとめて表示").clicked() {
+            chosen = Some(choices);
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("あとから設定で変更できます。")
+                .size(11.0)
+                .color(MUTED),
+        );
+        if let Some(services) = chosen {
+            self.settings.services = services;
+            self.choices = None;
+            self.services_changed(ui.ctx());
+        }
+    }
+
+    /// Show what is installed on the first launch, asking only when there is a choice.
+    fn first_run(&mut self, ctx: &egui::Context) {
+        self.settings.first_run = false;
+        let found: Vec<_> = ServiceId::ALL
+            .into_iter()
+            .filter(|service| service.detected())
+            .collect();
+        match found.as_slice() {
+            [] => {}
+            [only] => {
+                self.settings.services = vec![*only];
+                self.services_changed(ctx);
+            }
+            _ => self.choices = Some(found),
+        }
     }
 
     fn usage_ui(&mut self, ui: &mut egui::Ui, service: ServiceId) {
@@ -869,23 +1098,48 @@ impl Widget {
 
     fn services_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("表示するサービス").strong());
-        for service in ServiceId::ALL {
-            let mut shown = self.shows(service);
-            // At least one service stays selected.
-            let locked = shown && self.settings.services.len() == 1;
-            if ui
-                .add_enabled(!locked, egui::Checkbox::new(&mut shown, service.name()))
-                .changed()
-            {
-                if shown {
-                    self.settings.services.push(service);
-                } else {
-                    self.settings
-                        .services
-                        .retain(|selected| *selected != service);
+        // Selected services in display order, then the others.
+        let listed: Vec<_> = self
+            .settings
+            .services
+            .iter()
+            .copied()
+            .chain(
+                ServiceId::ALL
+                    .into_iter()
+                    .filter(|service| !self.shows(*service)),
+            )
+            .collect();
+        let mut changed = false;
+        for service in listed {
+            ui.horizontal(|ui| {
+                let position = self.settings.services.iter().position(|s| *s == service);
+                let mut shown = position.is_some();
+                // At least one service stays selected.
+                let locked = shown && self.settings.services.len() == 1;
+                if ui
+                    .add_enabled(!locked, egui::Checkbox::new(&mut shown, service.name()))
+                    .changed()
+                {
+                    if shown {
+                        self.settings.services.push(service);
+                    } else {
+                        self.settings
+                            .services
+                            .retain(|selected| *selected != service);
+                    }
+                    changed = true;
                 }
-                self.services_changed(ui.ctx());
-            }
+                if let Some(index) = position.filter(|index| *index > 0)
+                    && ui.small_button("上へ").clicked()
+                {
+                    self.settings.services.swap(index, index - 1);
+                    changed = true;
+                }
+            });
+        }
+        if changed {
+            self.services_changed(ui.ctx());
         }
         ui.label(
             RichText::new("2つ以上選ぶと、まとめて表示します。")
@@ -895,10 +1149,16 @@ impl Widget {
     }
 
     fn services_changed(&mut self, ctx: &egui::Context) {
+        if self.settings.services.len() == 1
+            || self.detail.is_some_and(|service| !self.shows(service))
+        {
+            self.detail = None;
+        }
         self.persist();
         self.sync_watcher(ctx);
         self.update_tray();
-        if self.usage.is_none() {
+        // Codex starts fetching when it is newly shown; otherwise its schedule continues.
+        if self.next_refresh.is_none() && self.worker.is_none() {
             self.refresh(ctx, true);
         }
     }
@@ -1103,7 +1363,11 @@ impl Widget {
 impl Widget {
     fn render(&mut self, ui: &mut egui::Ui) {
         let compact = self.settings.bar_mode && !self.settings_open;
-        let size = window_size(compact);
+        let size = if compact {
+            vec2(self.bar_width(ui), BAR_HEIGHT)
+        } else {
+            window_size(false)
+        };
         let margin = if compact {
             egui::Margin::symmetric(12, 7)
         } else {
@@ -1142,8 +1406,12 @@ impl Widget {
                 if !compact {
                     if self.settings_open {
                         self.settings_ui(ui);
+                    } else if let Some(choices) = self.choices.clone() {
+                        self.choose_ui(ui, choices);
+                    } else if let Some(service) = self.shown() {
+                        self.usage_ui(ui, service);
                     } else {
-                        self.usage_ui(ui, self.primary());
+                        self.combined_ui(ui);
                     }
                 }
             });
@@ -1193,6 +1461,9 @@ impl eframe::App for Widget {
         if !self.started {
             self.started = true;
             self.relink();
+            if self.settings.first_run {
+                self.first_run(ctx);
+            }
         }
         self.sync_watcher(ctx);
         if !self.tray_attempted {
@@ -1472,6 +1743,137 @@ mod tests {
             assert!(found, "{expected}");
             assert_eq!(widget.size.x, WIDTH);
         }
+        assert!(widget.worker.is_none());
+    }
+
+    #[test]
+    fn combined_view_lists_each_service_and_opens_its_card() {
+        use crate::quota::{Blocked, Group, Span, Window};
+        let ctx = egui::Context::default();
+        let mut widget = std::mem::ManuallyDrop::new(Widget::new(
+            &ctx,
+            Settings {
+                services: vec![ServiceId::Codex, ServiceId::ClaudeCode],
+                ..Default::default()
+            },
+        ));
+        let now = Local::now().timestamp();
+        let window = |minutes, remaining, resets_at| Window {
+            span: Span::Minutes(minutes),
+            remaining: Some(remaining),
+            resets_at: Some(resets_at),
+        };
+        widget.usage = Some(Snapshot {
+            groups: vec![Group::new(
+                None,
+                vec![
+                    window(10080, 62.0, now + 86_400),
+                    window(300, 88.0, now + 3600),
+                ],
+            )],
+            cap: None,
+            balance: None,
+            reset_credits: None,
+            blocked: None,
+            observed_at: Local::now(),
+        });
+        let until = now + 2 * 3600 + 13 * 60;
+        widget.received.insert(
+            ServiceId::ClaudeCode,
+            Snapshot {
+                groups: vec![Group::new(
+                    None,
+                    vec![window(300, 0.0, until), window(10080, 54.0, now + 86_400)],
+                )],
+                cap: None,
+                balance: None,
+                reset_credits: None,
+                blocked: Some(Blocked {
+                    label: "5時間の枠".into(),
+                    until: Some(until),
+                    minutes: Some(300),
+                }),
+                observed_at: Local::now(),
+            },
+        );
+        widget.last_started = Some(Instant::now());
+        let step = |widget: &mut Widget, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size)),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                },
+                |ui| widget.render(ui),
+            )
+        };
+        let texts = |widget: &mut Widget| {
+            let output = step(widget, vec![]);
+            let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size);
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    let rect = shape.shape.visual_bounding_rect();
+                    assert!(bounds.contains_rect(rect), "{}", text.galley.job.text);
+                    texts.push((text.galley.job.text.clone(), rect));
+                }
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+        let click = |widget: &mut Widget, pos: egui::Pos2| {
+            for pressed in [true, false] {
+                step(
+                    widget,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                )
+                .drop_without_applying_deltas();
+            }
+        };
+        texts(&mut widget);
+        let combined = texts(&mut widget);
+        let has = |texts: &[(String, egui::Rect)], wanted: &str| {
+            texts.iter().any(|(text, _)| text == wanted)
+        };
+        for wanted in [
+            "利用状況",
+            "Codex",
+            "Claude Code",
+            "5時間",
+            "週次",
+            "あと2:13",
+        ] {
+            assert!(has(&combined, wanted), "{wanted}");
+        }
+        assert_eq!(widget.size.x, WIDTH);
+        let section = combined
+            .iter()
+            .find(|(text, _)| text == "Claude Code")
+            .unwrap()
+            .1;
+        click(&mut widget, section.center());
+        assert_eq!(widget.detail, Some(ServiceId::ClaudeCode));
+        texts(&mut widget);
+        let detail = texts(&mut widget);
+        assert!(has(&detail, "リキャスト中（5時間の枠）"));
+        assert!(has(&detail, "週次の残り"));
+        click(&mut widget, egui::pos2(28.0, 33.0));
+        assert_eq!(widget.detail, None);
+        widget.settings.bar_mode = true;
+        texts(&mut widget);
+        let bar = texts(&mut widget);
+        let line: Vec<_> = bar.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(line, ["Codex 62%・Claude あと2:13", "⋯"]);
+        assert!(widget.size.x > BAR_WIDTH);
         assert!(widget.worker.is_none());
     }
 

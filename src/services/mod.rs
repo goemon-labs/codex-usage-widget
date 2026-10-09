@@ -25,6 +25,14 @@ impl ServiceId {
         }
     }
 
+    /// Names the service in the one-line bar.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::ClaudeCode => "Claude",
+        }
+    }
+
     /// Identifies the service in the status line command and in stored file names.
     pub fn key(self) -> &'static str {
         match self {
@@ -40,6 +48,14 @@ impl ServiceId {
     /// The service's own tool hands its usage to the widget while the tool is in use.
     pub fn received(self) -> bool {
         self != Self::Codex
+    }
+
+    /// Whether the service seems to be installed; only checks that its files exist.
+    pub fn detected(self) -> bool {
+        match self {
+            Self::Codex => codex::find_codex(None).is_some(),
+            Self::ClaudeCode => claude::config_dir().is_some_and(|directory| directory.is_dir()),
+        }
     }
 }
 
