@@ -132,8 +132,8 @@ pub struct Widget {
     notice: Option<String>,
     worker: Option<Worker>,
     watcher: Option<Watcher>,
-    /// A service whose registration failed, offered for manual setup.
-    failed_link: Option<ServiceId>,
+    /// When a passing confirmation, such as a completed connection, disappears.
+    notice_until: Option<Instant>,
     /// The service opened from the combined view.
     detail: Option<ServiceId>,
     /// Logos the user placed in the icons folder, shown in the bar instead of names.
@@ -211,7 +211,7 @@ impl Widget {
             notice: None,
             worker: None,
             watcher: None,
-            failed_link: None,
+            notice_until: None,
             detail: None,
             icons: BTreeMap::new(),
             choices: None,
@@ -270,9 +270,7 @@ impl Widget {
 
     fn source(&self, service: ServiceId) -> card::Source {
         card::Source {
-            name: service.name(),
             received: service.received(),
-            loading: service == ServiceId::Codex && self.worker.is_some() && self.usage.is_none(),
         }
     }
 
@@ -423,6 +421,7 @@ impl Widget {
         if self.settings.save().is_err() {
             self.notice =
                 Some("設定を保存できませんでした。保存先へのアクセスを確認してください。".into());
+            self.notice_until = None;
         }
     }
 
@@ -439,6 +438,7 @@ impl Widget {
             self.auto_start = enabled;
         } else {
             self.notice = Some("自動起動の設定を変更できませんでした。".into());
+            self.notice_until = None;
         }
     }
 
@@ -727,7 +727,7 @@ impl Widget {
                     let blocks = card::blocks(snapshot, &source, now);
                     if blocks.is_empty() {
                         ui.label(
-                            RichText::new("利用枠の情報を取得できませんでした")
+                            RichText::new("残量を確認できませんでした")
                                 .size(12.0)
                                 .color(MUTED),
                         );
@@ -744,7 +744,7 @@ impl Widget {
             {
                 ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
             } else if service.received() && !self.settings.bridges.contains_key(&service) {
-                ui.label(RichText::new("連携していません").size(12.0).color(MUTED));
+                ui.label(RichText::new("接続していません").size(12.0).color(MUTED));
             }
         }
         let used_height = ui.cursor().top() - ui.min_rect().top();
@@ -881,7 +881,7 @@ impl Widget {
         } else if service.received() && !self.settings.bridges.contains_key(&service) {
             ui.add_space(15.0);
             ui.label(
-                RichText::new(format!("{}に連携していません", service.name()))
+                RichText::new(format!("{}と接続していません", service.name()))
                     .size(11.0)
                     .color(MUTED),
             );
@@ -1003,7 +1003,7 @@ impl Widget {
             } else if let Some(credit) = first {
                 credit_expiry_label(credit.expires_at, now)
             } else if self.worker.is_some() && self.usage.is_none() {
-                "取得中…".into()
+                "確認中…".into()
             } else {
                 "有効期限を確認中".into()
             };
@@ -1118,12 +1118,6 @@ impl Widget {
             ui.add_space(8.0);
             ui.label(RichText::new(notice).size(11.0).color(MUTED));
         }
-        if let Some(service) = self.failed_link
-            && let Ok(command) = bridge::command(service)
-            && ui.small_button("コマンドをコピー").clicked()
-        {
-            ui.ctx().copy_text(command);
-        }
         ui.add_space(18.0);
         ui.label(
             RichText::new(format!("Codex Usage Widget  {}", env!("CARGO_PKG_VERSION")))
@@ -1142,11 +1136,7 @@ impl Widget {
             let mut checked = shown;
             // At least one service stays selected.
             let locked = shown && self.settings.services.len() == 1;
-            let label = if service.experimental() {
-                format!("{}（実験的）", service.name())
-            } else {
-                service.name().into()
-            };
+            let label = service.name();
             if ui
                 .add_enabled(
                     available && !locked,
@@ -1186,13 +1176,10 @@ impl Widget {
         if service == ServiceId::Codex {
             return self.codex_status();
         }
-        match (
-            self.settings.bridges.contains_key(&service),
-            self.received.get(&service),
-        ) {
-            (false, _) => "連携していません".into(),
-            (true, Some(snapshot)) => format!("{}に受信", time_label(snapshot.observed_at)),
-            (true, None) => format!("{}を使うと届きます", service.name()),
+        if self.settings.bridges.contains_key(&service) {
+            "接続中".into()
+        } else {
+            "接続していません".into()
         }
     }
 
@@ -1257,16 +1244,20 @@ impl Widget {
     /// Showing a service that reports on its own also connects it; hiding it undoes that.
     fn select(&mut self, ctx: &egui::Context, service: ServiceId, show: bool) {
         self.notice = None;
-        self.failed_link = None;
+        self.notice_until = None;
         if service.received() {
             let result = if show {
                 self.link(service)
             } else {
                 self.unlink(service)
             };
-            if let Err(message) = result {
-                self.notice = Some(format!("{}：{message}", service.name()));
-                self.failed_link = show.then_some(service);
+            if let Err(reason) = result {
+                let name = service.name();
+                self.notice = Some(if show {
+                    format!("{name}と接続できませんでした（{reason}）")
+                } else {
+                    format!("{name}との接続を解除できませんでした（{reason}）")
+                });
                 return;
             }
         }
@@ -1301,7 +1292,7 @@ impl Widget {
         }
         let record = bridge::link(service, None)?;
         self.settings.bridges.insert(service, record);
-        self.notice = Some(format!("{}に連携しました", service.name()));
+        self.flash(format!("{}と接続しました", service.name()));
         Ok(())
     }
 
@@ -1309,22 +1300,21 @@ impl Widget {
         let Some(record) = self.settings.bridges.get(&service).cloned() else {
             return Ok(());
         };
-        let restored = bridge::unlink(service, &record)?;
+        bridge::unlink(service, &record)?;
         self.settings.bridges.remove(&service);
         self.received.remove(&service);
         // Numbers that can no longer be updated would only mislead.
         if let Some(path) = bridge::received_path(service) {
             let _ = fs::remove_file(path);
         }
-        self.notice = Some(if restored {
-            format!("{}の連携を解除しました", service.name())
-        } else {
-            format!(
-                "{}の設定は変更済みのため、そのままにしました",
-                service.name()
-            )
-        });
+        self.flash(format!("{}との接続を解除しました", service.name()));
         Ok(())
+    }
+
+    /// A confirmation that disappears after a few seconds.
+    fn flash(&mut self, message: String) {
+        self.notice = Some(message);
+        self.notice_until = Some(Instant::now() + Duration::from_secs(4));
     }
 
     /// Keep registrations pointing at this executable after the app moves or is renamed.
@@ -1492,6 +1482,14 @@ impl eframe::App for Widget {
         if let Some(deadline) = self.save_after {
             if Instant::now() >= deadline {
                 self.persist();
+            } else {
+                ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+            }
+        }
+        if let Some(deadline) = self.notice_until {
+            if Instant::now() >= deadline {
+                self.notice = None;
+                self.notice_until = None;
             } else {
                 ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
             }
@@ -1706,7 +1704,7 @@ mod tests {
             balance: None,
             reset_credits: None,
             blocked: Some(Blocked {
-                label: "5時間の枠".into(),
+                label: "5時間".into(),
                 until: Some(now + 23 * 3600 + 59 * 60),
                 minutes: Some(300),
             }),
@@ -1803,7 +1801,7 @@ mod tests {
                 balance: None,
                 reset_credits: None,
                 blocked: Some(Blocked {
-                    label: "5時間の枠".into(),
+                    label: "5時間".into(),
                     until: Some(until),
                     minutes: Some(300),
                 }),
@@ -1865,7 +1863,7 @@ mod tests {
             "5時間の残り",
             "週次の残り",
             "62%",
-            "リキャスト中（5時間の枠）",
+            "5時間の上限に達しました",
         ] {
             assert!(has(&combined, wanted), "{wanted}");
         }
@@ -1874,7 +1872,7 @@ mod tests {
             .iter()
             .filter(|(text, _)| text == "リセット")
             .count();
-        assert_eq!(resets, 3);
+        assert_eq!(resets, 4);
         assert_eq!(widget.size.x, WIDTH);
         let section = combined
             .iter()
@@ -1885,7 +1883,7 @@ mod tests {
         assert_eq!(widget.detail, Some(ServiceId::ClaudeCode));
         texts(&mut widget);
         let detail = texts(&mut widget);
-        assert!(has(&detail, "リキャスト中（5時間の枠）"));
+        assert!(has(&detail, "5時間の上限に達しました"));
         assert!(has(&detail, "週次の残り"));
         click(&mut widget, egui::pos2(28.0, 33.0));
         assert_eq!(widget.detail, None);
@@ -1893,7 +1891,7 @@ mod tests {
         texts(&mut widget);
         let bar = texts(&mut widget);
         let line: Vec<_> = bar.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(line, ["Codex 62%", "Claude あと2:13", "⋯"]);
+        assert_eq!(line, ["Codex 62%", "Claude 上限", "⋯"]);
         // Logos the user provides take the place of the names.
         for service in [ServiceId::Codex, ServiceId::ClaudeCode] {
             let image = egui::ColorImage::filled([2, 2], Color32::WHITE);
@@ -1903,8 +1901,8 @@ mod tests {
         texts(&mut widget);
         let bar = texts(&mut widget);
         let line: Vec<_> = bar.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(line, ["62%", "あと2:13", "⋯"]);
-        assert!(widget.size.x > BAR_WIDTH);
+        assert_eq!(line, ["62%", "上限", "⋯"]);
+        assert!(widget.size.x >= BAR_WIDTH);
         assert!(widget.worker.is_none());
     }
 
@@ -2050,7 +2048,7 @@ mod tests {
             "表示するサービス",
             "Codex",
             "Claude Code",
-            "Antigravity CLI（実験的）",
+            "Antigravity CLI",
         ] {
             assert!(texts.iter().any(|text| text == wanted), "{wanted}");
         }

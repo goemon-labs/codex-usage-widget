@@ -138,12 +138,12 @@ pub fn command(service: ServiceId) -> io::Result<String> {
 
 /// Point the tool's status line at this widget, keeping what it showed before.
 pub fn link(service: ServiceId, existing: Option<&Bridge>) -> Result<Bridge, String> {
-    let path = tool_settings(service).ok_or("設定ファイルの場所を確認できませんでした。")?;
-    let command = command(service).map_err(|_| "このアプリの場所を確認できませんでした。")?;
+    let path = tool_settings(service).ok_or("設定ファイルが見つかりません")?;
+    let command = command(service).map_err(|_| "このアプリの場所が分かりません")?;
     let original = match fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(_) => return Err("設定ファイルを読み取れませんでした。".into()),
+        Err(_) => return Err("設定ファイルを開けません".into()),
     };
     let mut value = match &original {
         Some(bytes) => serde_json::from_slice(bytes).map_err(|_| UNREADABLE)?,
@@ -166,11 +166,11 @@ pub fn link(service: ServiceId, existing: Option<&Bridge>) -> Result<Bridge, Str
 
 /// Restore the tool's previous status line. Returns false when the user had already changed it.
 pub fn unlink(service: ServiceId, bridge: &Bridge) -> Result<bool, String> {
-    let path = tool_settings(service).ok_or("設定ファイルの場所を確認できませんでした。")?;
+    let path = tool_settings(service).ok_or("設定ファイルが見つかりません")?;
     let original = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err("設定ファイルを読み取れませんでした。".into()),
+        Err(_) => return Err("設定ファイルを開けません".into()),
     };
     let mut value: Value = serde_json::from_slice(&original).map_err(|_| UNREADABLE)?;
     if !uninstall(&mut value, bridge) {
@@ -201,7 +201,7 @@ pub fn relink(service: ServiceId, bridge: &Bridge) -> Option<Bridge> {
     })
 }
 
-const UNREADABLE: &str = "設定ファイルの形式を確認できませんでした。手動で設定してください。";
+const UNREADABLE: &str = "設定ファイルの内容に誤りがあります";
 
 fn line_command(line: &Value) -> Option<&str> {
     line.get("command")?.as_str()
@@ -254,7 +254,7 @@ fn write_tool_settings(
     original: Option<&[u8]>,
     value: &Value,
 ) -> Result<(), String> {
-    let failed = |_| "設定ファイルを書き込めませんでした。".to_string();
+    let failed = |_| "設定ファイルに書き込めません".to_string();
     // Keep a copy of the user's file in this app's data folder before changing it.
     if let Some(original) = original
         && let Some(dirs) = settings::project_dirs()
@@ -268,11 +268,7 @@ fn write_tool_settings(
         fs::create_dir_all(&backups).map_err(failed)?;
         fs::write(backups.join(name), original).map_err(failed)?;
     }
-    fs::create_dir_all(
-        path.parent()
-            .ok_or("設定ファイルの場所を確認できませんでした。")?,
-    )
-    .map_err(failed)?;
+    fs::create_dir_all(path.parent().ok_or("設定ファイルが見つかりません")?).map_err(failed)?;
     let bytes = serde_json::to_vec_pretty(value).map_err(|_| UNREADABLE)?;
     settings::write_atomic(path, &bytes).map_err(failed)
 }

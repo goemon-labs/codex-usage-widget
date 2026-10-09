@@ -143,7 +143,7 @@ impl Group {
             .filter(|window| window.exhausted(now))
             .max_by_key(|window| window.resets_at.unwrap_or(i64::MAX))?;
         Some(Blocked {
-            label: format!("{}の枠", self.window_label(window)),
+            label: self.window_label(window),
             until: window.resets_at,
             minutes: window.span.minutes(),
         })
@@ -173,7 +173,7 @@ pub struct Cap {
 /// The service has stopped ordinary usage until a limit recovers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Blocked {
-    /// What ran out, such as "5時間の枠".
+    /// What ran out, such as "5時間".
     pub label: String,
     pub until: Option<i64>,
     /// Length of the exhausted window, for showing progress toward recovery.
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(
             blocked(std::slice::from_ref(&group), now),
             Some(Blocked {
-                label: "週次の枠".into(),
+                label: "週次".into(),
                 until: Some(9_000),
                 minutes: Some(10080),
             })
@@ -386,7 +386,7 @@ mod tests {
         );
         assert_eq!(
             blocked(&[group, other], now).unwrap().label,
-            "Claude・GPT・週次の枠"
+            "Claude・GPT・週次"
         );
         let unknown = Group::new(None, vec![window(300, Some(0.0), None)]);
         assert_eq!(blocked(&[unknown], now).unwrap().until, None);

@@ -78,7 +78,8 @@ pub fn snapshot(data: &Value, received_at: DateTime<Local>, now: i64) -> Snapsho
         cap.remaining
             .is_some_and(|remaining| remaining <= 0.0)
             .then(|| Blocked {
-                label: cap.label.clone(),
+                // The cap reads "今月の利用額の上限"; name what ran out, "今月の利用額".
+                label: cap.label.trim_end_matches("の上限").into(),
                 until: cap.resets_at,
                 minutes: None,
             })
@@ -218,7 +219,7 @@ mod tests {
         assert_eq!(
             usage.blocked,
             Some(Blocked {
-                label: "5時間の枠".into(),
+                label: "5時間".into(),
                 until: Some(NOW + 600),
                 minutes: Some(FIVE_HOURS),
             })

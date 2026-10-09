@@ -194,7 +194,7 @@ mod tests {
             NOW,
         );
         let blocked = all.blocked.unwrap();
-        assert_eq!(blocked.label, "Gemini・5時間の枠");
+        assert_eq!(blocked.label, "Gemini・5時間");
         assert_eq!(blocked.until, Some(NOW + 600));
     }
 }

@@ -57,11 +57,6 @@ impl ServiceId {
         self != Self::Codex
     }
 
-    /// Supported on a best-effort basis until its status line data is confirmed on real accounts.
-    pub fn experimental(self) -> bool {
-        self == Self::AntigravityCli
-    }
-
     /// Where the service's tool keeps its settings, including its status line command.
     pub fn config_dir(self) -> Option<PathBuf> {
         match self {

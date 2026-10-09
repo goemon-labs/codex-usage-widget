@@ -5,20 +5,19 @@ use eframe::egui::{self, Align, Layout, RichText, Sense, vec2};
 
 /// How a service's numbers arrive, which changes how missing or stale data is described.
 pub(super) struct Source {
-    pub name: &'static str,
     /// Delivered by the service's own tool while it is in use, rather than fetched by the widget.
     pub received: bool,
-    /// A fetch is running and nothing has arrived yet.
-    pub loading: bool,
 }
 
-/// A large figure: what is left of a limit, or a countdown while it recovers.
+/// A large figure: what is left of a limit, or how long until a used-up limit resets.
 #[derive(Debug, PartialEq)]
 pub(super) struct Hero {
     pub label: String,
     pub value: String,
     /// The value in a few characters, for the one-line bar.
     pub short_value: String,
+    /// Time until usage resumes, such as "2時間13分", while a limit is used up.
+    pub wait: Option<String>,
     pub fraction: Option<f32>,
     pub blocked: bool,
     pub detail: Option<String>,
@@ -61,18 +60,17 @@ pub(super) fn hero(snapshot: Option<&Snapshot>, source: &Source, now: i64) -> He
         label: "週次の残り".into(),
         value: "—".into(),
         short_value: "—".into(),
+        wait: None,
         fraction: None,
         blocked: false,
         detail: None,
         caption: "リセット",
         when: if snapshot.is_some() {
-            "利用枠の情報を取得できませんでした".into()
-        } else if source.loading {
-            "取得中…".into()
+            "残量を確認できませんでした".into()
         } else if source.received {
-            "まだ受信していません".into()
+            "まだデータがありません".into()
         } else {
-            format!("{}の利用枠を確認します", source.name)
+            "確認中…".into()
         },
     }
 }
@@ -88,18 +86,17 @@ fn window_hero(group: &Group, window: &Window, source: &Source, now: i64) -> Her
         label: format!("{}の残り", group.window_label(window)),
         short_value: value.clone(),
         value,
+        wait: None,
         fraction: fraction(window.remaining).filter(|_| !expired),
         blocked: false,
         detail: None,
         caption: "リセット",
         when: if expired && source.received {
-            "リセット済み（次回の利用で更新）".into()
+            "リセット済み".into()
         } else if expired {
-            "リセット後の情報を確認中".into()
+            "確認中…".into()
         } else {
-            window
-                .resets_at
-                .map_or("リセット日時を確認できませんでした".into(), reset_label)
+            window.resets_at.map_or("不明".into(), reset_label)
         },
     }
 }
@@ -110,37 +107,38 @@ fn cap_hero(cap: &Cap) -> Hero {
         label: format!("{}の残り", cap.label),
         short_value: value.clone(),
         value,
+        wait: None,
         fraction: fraction(cap.remaining),
         blocked: false,
         detail: cap.detail.clone(),
         caption: "リセット",
-        when: cap
-            .resets_at
-            .map_or("リセット日時を確認できませんでした".into(), reset_label),
+        when: cap.resets_at.map_or("不明".into(), reset_label),
     }
 }
 
 fn blocked_hero(blocked: &Blocked, now: i64) -> Hero {
-    let (value, short_value) = match blocked.until {
-        Some(until) if until > now => (countdown_label(until, now), short_countdown(until, now)),
-        Some(_) => ("回復を確認中".into(), "確認中".into()),
-        None => ("上限に達しました".into(), "上限".into()),
-    };
+    let wait = blocked
+        .until
+        .filter(|until| *until > now)
+        .map(|until| duration_label(until, now));
     Hero {
-        label: format!("リキャスト中（{}）", blocked.label),
-        value,
-        short_value,
-        // The bar fills up as the exhausted window approaches its reset.
+        label: format!("{}の上限に達しました", blocked.label),
+        value: match (&wait, blocked.until) {
+            (Some(wait), _) => format!("あと {wait}"),
+            (None, Some(_)) => "確認中…".into(),
+            (None, None) => "—".into(),
+        },
+        short_value: "上限".into(),
+        wait,
+        // The bar fills up as the used-up limit approaches its reset.
         fraction: blocked.until.zip(blocked.minutes).map(|(until, minutes)| {
             let length = (minutes * 60).max(1) as f32;
             (1.0 - (until - now).max(0) as f32 / length).clamp(0.0, 1.0)
         }),
         blocked: true,
         detail: None,
-        caption: "回復予定",
-        when: blocked
-            .until
-            .map_or("回復時刻を確認できませんでした".into(), reset_label),
+        caption: "リセット",
+        when: blocked.until.map_or("不明".into(), reset_label),
     }
 }
 
@@ -154,7 +152,7 @@ pub(super) fn blocks(snapshot: &Snapshot, source: &Source, now: i64) -> Vec<Hero
         .map(|(group, window)| {
             if window.exhausted(now) {
                 let blocked = Blocked {
-                    label: format!("{}の枠", group.window_label(window)),
+                    label: group.window_label(window),
                     until: window.resets_at,
                     minutes: window.span.minutes(),
                 };
@@ -238,13 +236,13 @@ fn window_line(group: &Group, window: &Window, received: bool, now: i64) -> Line
     if window.exhausted(now) {
         return Line {
             title,
-            value: window
-                .resets_at
-                .map_or("0%".into(), |reset| countdown_label(reset, now)),
+            value: window.resets_at.map_or("0%".into(), |reset| {
+                format!("あと {}", duration_label(reset, now))
+            }),
             fraction: None,
             note: window
                 .resets_at
-                .map(|reset| format!("{} に回復", reset_label(reset))),
+                .map(|reset| format!("{} にリセット", reset_label(reset))),
             alert: true,
         };
     }
@@ -253,7 +251,7 @@ fn window_line(group: &Group, window: &Window, received: bool, now: i64) -> Line
         title,
         value: match (expired, received) {
             (true, true) => "リセット済み".into(),
-            (true, false) => "確認中".into(),
+            (true, false) => "確認中…".into(),
             (false, _) => window.remaining_label(),
         },
         fraction: fraction(window.remaining).filter(|_| !expired),
@@ -266,39 +264,24 @@ fn fraction(percent: Option<f64>) -> Option<f32> {
     percent.map(|value| (value / 100.0).clamp(0.0, 1.0) as f32)
 }
 
-/// Time left until a limit recovers, rounded up so it never reads zero too early.
-pub(super) fn countdown_label(until: i64, now: i64) -> String {
+/// Time left until `until`, rounded up so it never reads zero too early.
+fn duration_label(until: i64, now: i64) -> String {
     let minutes = ((until - now).max(0) + 59) / 60;
     if minutes >= 24 * 60 {
-        format!(
-            "あと {}日{}時間",
-            minutes / (24 * 60),
-            minutes % (24 * 60) / 60
-        )
+        format!("{}日{}時間", minutes / (24 * 60), minutes % (24 * 60) / 60)
     } else if minutes >= 60 {
-        format!("あと {}時間{}分", minutes / 60, minutes % 60)
+        format!("{}時間{}分", minutes / 60, minutes % 60)
     } else {
-        format!("あと {}分", minutes.max(1))
-    }
-}
-
-fn short_countdown(until: i64, now: i64) -> String {
-    let minutes = ((until - now).max(0) + 59) / 60;
-    if minutes >= 24 * 60 {
-        format!("あと{}日", (minutes + 24 * 60 - 1) / (24 * 60))
-    } else if minutes >= 60 {
-        format!("あと{}:{:02}", minutes / 60, minutes % 60)
-    } else {
-        format!("あと{}分", minutes.max(1))
+        format!("{}分", minutes.max(1))
     }
 }
 
 /// One-line text for the bar mode.
 pub(super) fn bar_text(hero: &Hero) -> String {
-    if hero.blocked {
-        format!("リキャスト中 {}", hero.value)
-    } else {
-        format!("{} {}", hero.label, hero.value)
+    match (&hero.wait, hero.blocked) {
+        (Some(wait), _) => format!("利用再開まで {wait}"),
+        (None, true) => hero.label.clone(),
+        (None, false) => format!("{} {}", hero.label, hero.value),
     }
 }
 
@@ -387,16 +370,8 @@ mod tests {
         }
     }
 
-    const CODEX: Source = Source {
-        name: "Codex",
-        received: false,
-        loading: false,
-    };
-    const CLAUDE: Source = Source {
-        name: "Claude Code",
-        received: true,
-        loading: false,
-    };
+    const CODEX: Source = Source { received: false };
+    const CLAUDE: Source = Source { received: true };
 
     #[test]
     fn the_weekly_window_leads_and_the_rest_are_listed() {
@@ -442,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_service_counts_down_and_lists_the_other_windows() {
+    fn a_used_up_limit_shows_the_time_until_it_resets() {
         let until = NOW + 2 * 3600 + 13 * 60;
         let usage = snapshot(
             vec![Group::new(
@@ -453,16 +428,17 @@ mod tests {
                 ],
             )],
             Some(Blocked {
-                label: "5時間の枠".into(),
+                label: "5時間".into(),
                 until: Some(until),
                 minutes: Some(300),
             }),
         );
         let hero = hero(Some(&usage), &CLAUDE, NOW);
-        assert_eq!(hero.label, "リキャスト中（5時間の枠）");
+        assert_eq!(hero.label, "5時間の上限に達しました");
         assert_eq!(hero.value, "あと 2時間13分");
-        assert_eq!(hero.short_value, "あと2:13");
-        assert_eq!(bar_text(&hero), "リキャスト中 あと 2時間13分");
+        assert_eq!(hero.short_value, "上限");
+        assert_eq!(hero.caption, "リセット");
+        assert_eq!(bar_text(&hero), "利用再開まで 2時間13分");
         assert!(
             hero.fraction
                 .is_some_and(|fraction| (fraction - 0.556).abs() < 0.01)
@@ -470,19 +446,20 @@ mod tests {
         let lines = lines(&usage, true, NOW);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].title, "週次の残り");
-        // Each window keeps its own figure; the exhausted one counts down.
+        // Each window keeps its own figure; the used-up one counts down.
         let blocks = blocks(&usage, &CLAUDE, NOW);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0], hero);
         assert_eq!(blocks[1].label, "週次の残り");
-        // Received numbers past their reset no longer claim usage is blocked.
+        // Received numbers past their reset no longer claim usage is stopped.
         let later = super::hero(Some(&usage), &CLAUDE, until + 1);
         assert!(!later.blocked);
         assert_eq!(later.label, "週次の残り");
-        // Fetched numbers say so until the next fetch confirms the reset.
+        // Fetched numbers wait for the next fetch to confirm the reset.
         let pending = super::hero(Some(&usage), &CODEX, until + 1);
         assert!(pending.blocked);
-        assert_eq!(pending.value, "回復を確認中");
+        assert_eq!(pending.value, "確認中…");
+        assert_eq!(bar_text(&pending), "5時間の上限に達しました");
     }
 
     #[test]
@@ -498,6 +475,7 @@ mod tests {
         let hero = hero(Some(&usage), &CODEX, NOW);
         assert_eq!(hero.label, "月間クレジット上限の残り");
         assert_eq!(hero.value, "62%");
+        assert_eq!(hero.when, "不明");
         assert_eq!(hero.detail.as_deref(), Some("314 / 500 クレジット使用"));
         let lines = lines(&usage, false, NOW);
         assert_eq!(lines.len(), 1);
@@ -537,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_missing_data_are_described_by_how_the_service_reports() {
+    fn stale_and_missing_data_use_plain_words() {
         let expired = snapshot(
             vec![Group::new(
                 None,
@@ -548,35 +526,24 @@ mod tests {
             )],
             None,
         );
-        assert_eq!(
-            hero(Some(&expired), &CODEX, NOW).when,
-            "リセット後の情報を確認中"
-        );
-        assert_eq!(
-            hero(Some(&expired), &CLAUDE, NOW).when,
-            "リセット済み（次回の利用で更新）"
-        );
-        assert_eq!(lines(&expired, false, NOW)[0].value, "確認中");
+        assert_eq!(hero(Some(&expired), &CODEX, NOW).when, "確認中…");
+        assert_eq!(hero(Some(&expired), &CLAUDE, NOW).when, "リセット済み");
+        assert_eq!(lines(&expired, false, NOW)[0].value, "確認中…");
         assert_eq!(lines(&expired, true, NOW)[0].value, "リセット済み");
         assert_eq!(blocks(&expired, &CLAUDE, NOW)[0].value, "—");
-        assert_eq!(hero(None, &CLAUDE, NOW).when, "まだ受信していません");
-        assert_eq!(hero(None, &CODEX, NOW).when, "Codexの利用枠を確認します");
-        let loading = Source {
-            loading: true,
-            ..CODEX
-        };
-        assert_eq!(hero(None, &loading, NOW).when, "取得中…");
+        assert_eq!(hero(None, &CLAUDE, NOW).when, "まだデータがありません");
+        assert_eq!(hero(None, &CODEX, NOW).when, "確認中…");
+        let unknown = snapshot(vec![Group::default()], None);
+        assert_eq!(
+            hero(Some(&unknown), &CODEX, NOW).when,
+            "残量を確認できませんでした"
+        );
     }
 
     #[test]
-    fn countdowns_round_up_to_the_next_minute() {
-        assert_eq!(countdown_label(NOW + 1, NOW), "あと 1分");
-        assert_eq!(countdown_label(NOW + 59 * 60 + 1, NOW), "あと 1時間0分");
-        assert_eq!(
-            countdown_label(NOW + 3 * 86_400 + 4 * 3600, NOW),
-            "あと 3日4時間"
-        );
-        assert_eq!(short_countdown(NOW + 3 * 86_400 + 4 * 3600, NOW), "あと4日");
-        assert_eq!(short_countdown(NOW + 125 * 60, NOW), "あと2:05");
+    fn waits_round_up_to_the_next_minute() {
+        assert_eq!(duration_label(NOW + 1, NOW), "1分");
+        assert_eq!(duration_label(NOW + 59 * 60 + 1, NOW), "1時間0分");
+        assert_eq!(duration_label(NOW + 3 * 86_400 + 4 * 3600, NOW), "3日4時間");
     }
 }

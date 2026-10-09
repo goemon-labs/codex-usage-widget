@@ -20,7 +20,7 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-pub const SETUP_GUIDANCE: &str = "Codexが見つかりません。CLIまたはアプリをインストールしてください。インストール済みの場合は、設定の「場所を選択」で指定してください。";
+pub const SETUP_GUIDANCE: &str = "Codexが見つかりません。インストール済みの場合は、設定の「Codexの場所を選択」から指定してください。";
 
 #[derive(Clone, Debug)]
 pub struct Installation {
@@ -58,7 +58,7 @@ impl FetchError {
     fn connection() -> Self {
         Self::new(
             ErrorKind::Connection,
-            "Codexに接続できませんでした。通信状態を確認して再試行してください。",
+            "Codexに接続できませんでした。通信状態を確認してください。",
         )
     }
 }
@@ -206,12 +206,11 @@ pub fn fetch(
     let child = command.spawn().map_err(|_| {
         FetchError::new(
             ErrorKind::Setup,
-            "Codexを起動できませんでした。設定の「場所を選択」で、利用可能なCodexの実行ファイルを指定してください。",
+            "Codexを起動できませんでした。設定の「Codexの場所を選択」から指定し直してください。",
         )
     })?;
-    let mut process = ProcessGuard::new(child).map_err(|_| {
-        FetchError::new(ErrorKind::Setup, "Codexの補助処理を開始できませんでした。")
-    })?;
+    let mut process = ProcessGuard::new(child)
+        .map_err(|_| FetchError::new(ErrorKind::Setup, "Codexを起動できませんでした。"))?;
     let stdout = process
         .child
         .stdout
@@ -255,7 +254,7 @@ pub fn fetch(
         if account["type"].as_str() != Some("chatgpt") {
             return Err(FetchError::new(
                 ErrorKind::Login,
-                "公式CodexにChatGPTアカウントでログインしてください。",
+                "CodexにChatGPTアカウントでログインしてください。",
             ));
         }
         account_changed(Account {
@@ -296,7 +295,7 @@ fn receive(
         if remaining.is_zero() {
             return Err(FetchError::new(
                 ErrorKind::Connection,
-                "取得に時間がかかっています。しばらくしてから再試行してください。",
+                "時間がかかっています。しばらくしてからお試しください。",
             ));
         }
         match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
@@ -317,13 +316,10 @@ fn receive(
                     return Err(if login {
                         FetchError::new(
                             ErrorKind::Login,
-                            "公式Codexでログインを確認し、再試行してください。",
+                            "Codexにログインし直してから、もう一度お試しください。",
                         )
                     } else if code == Some(-32601) {
-                        FetchError::new(
-                            ErrorKind::Unsupported,
-                            "このCodexは利用枠の取得に対応していません。Codexを更新してください。",
-                        )
+                        FetchError::new(ErrorKind::Unsupported, "Codexを最新版に更新してください。")
                     } else {
                         FetchError::connection()
                     });
@@ -414,24 +410,24 @@ fn credits(raw: &str) -> String {
         .map_or_else(|| raw.to_string(), quota::amount_label)
 }
 
+const UNREADABLE_USAGE: &str = "残量を確認できませんでした。Codexを最新版に更新してください。";
+
 /// Convert an `account/rateLimits/read` response into display data.
 fn snapshot(response: &Value, now: i64) -> Result<Snapshot, &'static str> {
     let buckets = response
         .get("rateLimitsByLimitId")
         .and_then(Value::as_object);
     let main = match buckets {
-        Some(buckets) => buckets
-            .get("codex")
-            .ok_or("Codexの利用枠を確認できませんでした")?,
+        Some(buckets) => buckets.get("codex").ok_or(UNREADABLE_USAGE)?,
         None => response
             .get("rateLimits")
             .filter(|value| !value.is_null())
-            .ok_or("利用枠の応答を確認できませんでした")?,
+            .ok_or(UNREADABLE_USAGE)?,
     };
     let mut main: RawSnapshot =
-        serde_json::from_value(main.clone()).map_err(|_| "利用枠の形式を確認できませんでした")?;
+        serde_json::from_value(main.clone()).map_err(|_| UNREADABLE_USAGE)?;
     if main.limit_id.as_deref().is_some_and(|id| id != "codex") {
-        return Err("Codexの利用枠を確認できませんでした");
+        return Err(UNREADABLE_USAGE);
     }
     let mut groups = vec![Group::new(None, main.windows())];
     // Additional metered limits, such as model-specific allowances, are named by the server.
@@ -482,9 +478,9 @@ fn snapshot(response: &Value, now: i64) -> Result<Snapshot, &'static str> {
         quota::blocked(&groups[..1], now).or_else(|| {
             reached.then(|| Blocked {
                 label: if spend_reached {
-                    "月間クレジット上限".into()
+                    "月間クレジット".into()
                 } else {
-                    "利用上限".into()
+                    "利用".into()
                 },
                 until: cap
                     .as_ref()
@@ -678,7 +674,7 @@ mod tests {
         assert_eq!(
             blocked(json!(false), 100.0),
             Some(Blocked {
-                label: "5時間の枠".into(),
+                label: "5時間".into(),
                 until: Some(5_000),
                 minutes: Some(300),
             })
@@ -689,7 +685,7 @@ mod tests {
         assert!(blocked(Value::Null, 100.0).is_some());
         assert!(blocked(Value::Null, 50.0).is_none());
         let unknown = blocked(json!(false), 50.0).unwrap();
-        assert_eq!((unknown.label.as_str(), unknown.until), ("利用上限", None));
+        assert_eq!((unknown.label.as_str(), unknown.until), ("利用", None));
         let spend = snapshot(
             &json!({"rateLimits": {"spendControlReached": true, "individualLimit":
                 {"limit": "500", "used": "500", "remainingPercent": 0, "resetsAt": 7_000}}}),
