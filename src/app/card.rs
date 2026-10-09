@@ -526,7 +526,10 @@ mod tests {
         let later = super::hero(Some(&usage), &CLAUDE, until + 1);
         assert!(!later.blocked);
         assert_eq!(later.label, "週次の残り");
-        assert!(super::hero(Some(&usage), &CODEX, until + 1).blocked);
+        // Fetched numbers say so until the next fetch confirms the reset.
+        let pending = super::hero(Some(&usage), &CODEX, until + 1);
+        assert!(pending.blocked);
+        assert_eq!(pending.value, "回復を確認中");
     }
 
     #[test]
