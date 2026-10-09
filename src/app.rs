@@ -664,7 +664,8 @@ impl Widget {
         ui.horizontal(|ui| {
             if welcome {
                 self.brand_ui(ui);
-            } else if !compact && !self.settings_open && self.detail.is_some() && shown.is_some() {
+            } else if !compact && (self.settings_open || (self.detail.is_some() && shown.is_some()))
+            {
                 self.back_button(ui);
             } else {
                 let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
@@ -701,7 +702,12 @@ impl Widget {
     fn back_button(&mut self, ui: &mut egui::Ui) {
         let (rect, response) = ui.allocate_exact_size(vec2(14.0, 24.0), Sense::click());
         response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "まとめ表示に戻る")
+            let label = if self.settings_open {
+                "前の画面に戻る"
+            } else {
+                "まとめ表示に戻る"
+            };
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label)
         });
         let color = if response.hovered() {
             FOREGROUND
@@ -721,7 +727,11 @@ impl Widget {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
-            self.detail = None;
+            if self.settings_open {
+                self.settings_open = false;
+            } else {
+                self.detail = None;
+            }
         }
     }
 
