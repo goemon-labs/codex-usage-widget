@@ -31,7 +31,7 @@ macOS版は実機での動作が未検証のため、試験対応です。
 | サービス | 必要なもの |
 | --- | --- |
 | Codex | 公式のデスクトップアプリ、またはCodex CLI（コマンドで操作する版）に、ChatGPTアカウントでログイン |
-| Claude Code | Claude Code（CLI）に、Pro・Maxプランなど利用枠のあるプランでログイン |
+| Claude Code | Claude Code CLIに、Pro・Maxプランなど利用枠のあるプランでログイン |
 | Antigravity CLI | Antigravity CLIにログイン |
 
 [Codexアプリの導入手順](https://learn.chatgpt.com/docs/quickstart?setup=app) · [Codex CLIの導入手順](https://developers.openai.com/codex/cli/)

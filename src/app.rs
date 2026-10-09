@@ -138,8 +138,10 @@ pub struct Widget {
     detail: Option<ServiceId>,
     /// Logos the user placed in the icons folder, shown in the bar instead of names.
     icons: BTreeMap<ServiceId, egui::TextureHandle>,
-    /// Services found on the first launch, waiting for the user to pick what to show.
-    choices: Option<Vec<ServiceId>>,
+    /// Services found on the first launch and whether each is picked, until the user starts.
+    choices: Option<Vec<(ServiceId, bool)>>,
+    /// The app's mark, loaded only for the first-launch screen.
+    logo: Option<egui::TextureHandle>,
     started: bool,
     fetch_tx: Sender<FetchEvent>,
     fetch_rx: Receiver<FetchEvent>,
@@ -215,6 +217,7 @@ impl Widget {
             detail: None,
             icons: BTreeMap::new(),
             choices: None,
+            logo: None,
             started: false,
             fetch_tx,
             fetch_rx,
@@ -418,6 +421,10 @@ impl Widget {
 
     fn persist(&mut self) {
         self.save_after = None;
+        // Until the first choice is made, the next launch asks again.
+        if self.choices.is_some() {
+            return;
+        }
         if self.settings.save().is_err() {
             self.notice =
                 Some("設定を保存できませんでした。保存先へのアクセスを確認してください。".into());
@@ -652,8 +659,12 @@ impl Widget {
         let now = Local::now().timestamp();
         let heroes = self.heroes(now);
         let shown = self.shown();
+        // The first launch introduces the app instead of showing a status.
+        let welcome = !compact && !self.settings_open && self.choices.is_some();
         ui.horizontal(|ui| {
-            if !compact && !self.settings_open && self.detail.is_some() && shown.is_some() {
+            if welcome {
+                self.brand_ui(ui);
+            } else if !compact && !self.settings_open && self.detail.is_some() && shown.is_some() {
                 self.back_button(ui);
             } else {
                 let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
@@ -669,7 +680,7 @@ impl Widget {
             }
             if compact {
                 self.bar_ui(ui, now);
-            } else {
+            } else if !welcome {
                 let title = if self.settings_open {
                     "設定"
                 } else {
@@ -712,6 +723,33 @@ impl Widget {
         {
             self.detail = None;
         }
+    }
+
+    /// The app's mark and name, shown while the services are chosen on the first launch.
+    fn brand_ui(&mut self, ui: &mut egui::Ui) {
+        let logo = self
+            .logo
+            .get_or_insert_with(|| {
+                let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .expect("bundled icon is valid");
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                );
+                // Mipmaps keep the large icon smooth at this small size.
+                let options = egui::TextureOptions {
+                    mipmap_mode: Some(egui::TextureFilter::Linear),
+                    ..egui::TextureOptions::LINEAR
+                };
+                ui.ctx().load_texture("logo", image, options)
+            })
+            .id();
+        ui.add(egui::Image::new((logo, vec2(32.0, 32.0))));
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.label(RichText::new("ReCast").size(16.0));
+            ui.label(RichText::new("AI Usage Widget").size(10.0).color(MUTED));
+        });
     }
 
     /// Every selected service in one card, each in its own section.
@@ -794,29 +832,42 @@ impl Widget {
     }
 
     /// Shown on the first launch when a service other than Codex is installed.
-    fn choose_ui(&mut self, ui: &mut egui::Ui, choices: Vec<ServiceId>) {
-        ui.add_space(17.0);
+    fn choose_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(choices) = self.choices.as_mut() else {
+            return;
+        };
+        ui.add_space(18.0);
         ui.label(RichText::new("表示するサービスを選んでください").size(13.0));
-        ui.add_space(6.0);
-        let mut chosen = None;
-        for &service in &choices {
-            if ui.button(service.name()).clicked() {
-                chosen = Some(vec![service]);
+        ui.add_space(3.0);
+        for (index, (service, picked)) in choices.iter_mut().enumerate() {
+            if index > 0 {
+                ui.add_space(2.0);
+            }
+            if choice_ui(ui, service.name(), *picked).clicked() {
+                *picked = !*picked;
             }
         }
-        if choices.len() > 1 && ui.button("まとめて表示").clicked() {
-            chosen = Some(choices);
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("あとから設定で変更できます。")
-                .size(11.0)
-                .color(MUTED),
+        let picked: Vec<_> = choices
+            .iter()
+            .filter(|(_, picked)| *picked)
+            .map(|(service, _)| *service)
+            .collect();
+        // Keep the start button and the note at the bottom of the card.
+        let used_height = ui.cursor().top() - ui.min_rect().top();
+        ui.add_space((HEIGHT - 42.0 - used_height - 55.0).max(12.0));
+        let start = primary_button(ui, "はじめる", !picked.is_empty());
+        let (note, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
+        ui.painter().text(
+            note.center(),
+            egui::Align2::CENTER_CENTER,
+            "あとから設定で変更できます。",
+            egui::FontId::proportional(10.0),
+            MUTED,
         );
-        if let Some(services) = chosen {
+        if start.clicked() && !picked.is_empty() {
             self.choices = None;
             self.settings.services.clear();
-            for service in services {
+            for service in picked {
                 self.select(ui.ctx(), service, true);
             }
             if self.settings.services.is_empty() {
@@ -834,7 +885,7 @@ impl Widget {
             .filter(|service| service.detected())
             .collect();
         if found.iter().any(|service| service.received()) {
-            self.choices = Some(found);
+            self.choices = Some(found.into_iter().map(|service| (service, false)).collect());
         }
     }
 
@@ -1378,8 +1429,8 @@ impl Widget {
                 if !compact {
                     if self.settings_open {
                         self.settings_ui(ui);
-                    } else if let Some(choices) = self.choices.clone() {
-                        self.choose_ui(ui, choices);
+                    } else if self.choices.is_some() {
+                        self.choose_ui(ui);
                     } else if let Some(service) = self.shown() {
                         self.usage_ui(ui, service);
                     } else {
@@ -1572,6 +1623,82 @@ fn move_up_button(ui: &mut egui::Ui) -> egui::Response {
         Stroke::new(1.3, color),
     ));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A service on the first launch; clicking it picks or unpicks it.
+fn choice_ui(ui: &mut egui::Ui, name: &str, picked: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, picked, name));
+    let hovered = response.hovered();
+    let (fill, stroke) = if picked {
+        (Color32::from_rgb(28, 44, 43), GREEN)
+    } else if hovered {
+        (Color32::from_rgb(31, 37, 44), Color32::from_rgb(66, 77, 88))
+    } else {
+        (Color32::from_rgb(25, 30, 36), BORDER)
+    };
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        10.0,
+        fill,
+        Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_center() + vec2(14.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::proportional(14.0),
+        FOREGROUND,
+    );
+    let mark = rect.right_center() - vec2(21.0, 0.0);
+    if picked {
+        painter.circle_filled(mark, 8.0, GREEN);
+        painter.add(egui::Shape::line(
+            vec![
+                mark + vec2(-3.5, 0.2),
+                mark + vec2(-1.0, 2.7),
+                mark + vec2(3.6, -2.5),
+            ],
+            Stroke::new(1.8, BACKGROUND),
+        ));
+    } else {
+        let ring = if hovered {
+            MUTED
+        } else {
+            Color32::from_rgb(78, 89, 100)
+        };
+        painter.circle_stroke(mark, 7.5, Stroke::new(1.2, ring));
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The main action of a screen, filled with the accent color once it can be used.
+fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
+    let (fill, color) = if !enabled {
+        (Color32::from_rgb(40, 72, 63), Color32::from_rgb(19, 36, 32))
+    } else if response.hovered() {
+        (Color32::from_rgb(128, 231, 191), BACKGROUND)
+    } else {
+        (GREEN, BACKGROUND)
+    };
+    ui.painter().rect_filled(rect, 10.0, fill);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(14.0),
+        color,
+    );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 /// Codex reports plan ids such as "plus"; Pro tiers share one name.
@@ -1859,7 +1986,7 @@ mod tests {
         for wanted in [
             "利用状況",
             "Codex",
-            "Claude Code（CLI）",
+            "Claude Code CLI",
             "5時間の残り",
             "週次の残り",
             "62%",
@@ -1876,7 +2003,7 @@ mod tests {
         assert_eq!(widget.size.x, WIDTH);
         let section = combined
             .iter()
-            .find(|(text, _)| text == "Claude Code（CLI）")
+            .find(|(text, _)| text == "Claude Code CLI")
             .unwrap()
             .1;
         click(&mut widget, section.center());
@@ -1903,6 +2030,85 @@ mod tests {
         let line: Vec<_> = bar.iter().map(|(text, _)| text.as_str()).collect();
         assert_eq!(line, ["62%", "上限", "⋯"]);
         assert!(widget.size.x >= BAR_WIDTH);
+        assert!(widget.worker.is_none());
+    }
+
+    #[test]
+    fn first_launch_screen_fits_the_card_and_picks_services() {
+        let ctx = egui::Context::default();
+        let mut widget = std::mem::ManuallyDrop::new(Widget::new(&ctx, Settings::default()));
+        widget.choices = Some(
+            ServiceId::ALL
+                .into_iter()
+                .map(|service| (service, false))
+                .collect(),
+        );
+        widget.last_started = Some(Instant::now());
+        let step = |widget: &mut Widget, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size)),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                },
+                |ui| widget.render(ui),
+            )
+        };
+        let texts = |widget: &mut Widget| {
+            let output = step(widget, vec![]);
+            let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, widget.size);
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    let rect = shape.shape.visual_bounding_rect();
+                    assert!(bounds.contains_rect(rect), "{}", text.galley.job.text);
+                    texts.push((text.galley.job.text.clone(), rect));
+                }
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+        texts(&mut widget);
+        let screen = texts(&mut widget);
+        for wanted in [
+            "ReCast",
+            "表示するサービスを選んでください",
+            "Codex",
+            "Claude Code CLI",
+            "Antigravity CLI",
+            "はじめる",
+            "あとから設定で変更できます。",
+        ] {
+            assert!(screen.iter().any(|(text, _)| text == wanted), "{wanted}");
+        }
+        assert_eq!(widget.size, vec2(WIDTH, HEIGHT));
+        let claude = screen
+            .iter()
+            .find(|(text, _)| text == "Claude Code CLI")
+            .unwrap()
+            .1;
+        for picked in [true, false] {
+            for pressed in [true, false] {
+                step(
+                    &mut widget,
+                    vec![
+                        egui::Event::PointerMoved(claude.center()),
+                        egui::Event::PointerButton {
+                            pos: claude.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                )
+                .drop_without_applying_deltas();
+            }
+            assert_eq!(
+                widget.choices.as_ref().unwrap()[1],
+                (ServiceId::ClaudeCode, picked)
+            );
+        }
         assert!(widget.worker.is_none());
     }
 
@@ -2047,7 +2253,7 @@ mod tests {
             "設定",
             "表示するサービス",
             "Codex",
-            "Claude Code（CLI）",
+            "Claude Code CLI",
             "Antigravity CLI",
         ] {
             assert!(texts.iter().any(|text| text == wanted), "{wanted}");
