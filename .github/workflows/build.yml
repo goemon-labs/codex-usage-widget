@@ -47,7 +47,7 @@ jobs:
         run: python scripts/package.py --target ${{ matrix.target }} --build
       - uses: actions/upload-artifact@v7
         with:
-          name: codex-usage-widget-${{ matrix.target }}
+          name: recast-widget-${{ matrix.target }}
           path: |
             dist/*.zip
             dist/*-setup.exe

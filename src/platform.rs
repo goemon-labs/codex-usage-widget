@@ -57,12 +57,12 @@ pub fn create_tray(
     }));
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/tray.png"))?;
     Ok(TrayIconBuilder::new()
-        .with_id("codex-usage-widget")
+        .with_id("recast-widget")
         .with_menu(Box::new(menu))
         .with_icon(Icon::from_rgba(icon.rgba, icon.width, icon.height)?)
         .with_icon_as_template(cfg!(target_os = "macos"))
         .with_menu_on_left_click(cfg!(target_os = "macos"))
-        .with_tooltip("Codex Usage Widget")
+        .with_tooltip("ReCast")
         .build()?)
 }
 
@@ -91,13 +91,27 @@ pub fn configure_window(cc: &eframe::CreationContext<'_>) {
 }
 
 pub fn auto_launch() -> Result<AutoLaunch, String> {
+    launcher("ReCast")
+}
+
+/// Move a login item registered under the previous name, Codex Usage Widget, to the current name.
+pub fn migrate_auto_launch() {
+    let (Ok(previous), Ok(current)) = (launcher("Codex Usage Widget"), auto_launch()) else {
+        return;
+    };
+    if previous.is_enabled().unwrap_or(false) && previous.disable().is_ok() {
+        let _ = current.enable();
+    }
+}
+
+fn launcher(name: &str) -> Result<AutoLaunch, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let app_path = executable.to_string_lossy();
     #[cfg(windows)]
     // The Windows startup entry is a command line, so installation paths may contain spaces.
     let app_path = format!("\"{app_path}\"");
     AutoLaunchBuilder::new()
-        .set_app_name("Codex Usage Widget")
+        .set_app_name(name)
         .set_app_path(&app_path)
         .set_windows_enable_mode(auto_launch::WindowsEnableMode::CurrentUser)
         .set_macos_launch_mode(auto_launch::MacOSLaunchMode::LaunchAgent)

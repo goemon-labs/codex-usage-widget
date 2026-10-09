@@ -1120,7 +1120,7 @@ impl Widget {
         }
         ui.add_space(18.0);
         ui.label(
-            RichText::new(format!("Codex Usage Widget  {}", env!("CARGO_PKG_VERSION")))
+            RichText::new(format!("ReCast  {}", env!("CARGO_PKG_VERSION")))
                 .size(10.0)
                 .color(MUTED),
         );
@@ -1859,7 +1859,7 @@ mod tests {
         for wanted in [
             "利用状況",
             "Codex",
-            "Claude Code",
+            "Claude Code（CLI）",
             "5時間の残り",
             "週次の残り",
             "62%",
@@ -1876,7 +1876,7 @@ mod tests {
         assert_eq!(widget.size.x, WIDTH);
         let section = combined
             .iter()
-            .find(|(text, _)| text == "Claude Code")
+            .find(|(text, _)| text == "Claude Code（CLI）")
             .unwrap()
             .1;
         click(&mut widget, section.center());
@@ -2047,7 +2047,7 @@ mod tests {
             "設定",
             "表示するサービス",
             "Codex",
-            "Claude Code",
+            "Claude Code（CLI）",
             "Antigravity CLI",
         ] {
             assert!(texts.iter().any(|text| text == wanted), "{wanted}");

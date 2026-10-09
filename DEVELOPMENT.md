@@ -21,7 +21,8 @@ Windows版はWindows上で、macOS版はmacOS上でビルドします。
 cargo run --locked --release
 ```
 
-利用枠を取得するには、公式CodexのアプリまたはCLIにChatGPTアカウントでログインしておく必要があります。
+Codexの利用枠を取得するには、公式CodexのアプリまたはCLIにChatGPTアカウントでログインしておく必要があります。
+Claude Code・Antigravity CLIは、ウィジェットの設定で接続してから各ツールを使います。
 
 ## コードの確認
 
@@ -50,6 +51,14 @@ cargo run --locked --release -- --check
 ```sh
 cargo run --locked --release -- --check-app
 ```
+
+## Claude Code・Antigravity CLIとの接続
+
+各ツールの公式ステータスライン機能を使います。仕様は[Claude Codeのステータスライン](https://code.claude.com/docs/en/statusline)と[Antigravity CLIのステータスライン](https://www.antigravity.google/docs/cli/statusline)を参照してください。
+
+ウィジェットの設定でサービスを選ぶと、ツールの設定ファイルの `statusLine` に `recast-widget statusline claude` または `recast-widget statusline antigravity` を登録します。
+ツールは使用中にセッション情報のJSONを標準入力で渡します。ReCastは利用枠の項目だけをアプリのデータフォルダの `received` に保存し、ウィジェットはその更新を読み取って表示します。
+登録前にステータスラインのコマンドがあった場合は、同じ入力でそのコマンドも実行し、出力をそのまま表示します。
 
 ## 配布ファイルの作成
 

@@ -1,11 +1,11 @@
 [package]
-name = "codex-usage-widget"
+name = "recast-widget"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-repository = "https://github.com/goemon-labs/codex-usage-widget"
-description = "A small desktop widget for Codex subscription usage"
+repository = "https://github.com/goemon-labs/recast-widget"
+description = "A desktop widget for the usage limits of Codex, Claude Code and Antigravity CLI"
 
 [dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow"] }

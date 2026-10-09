@@ -55,7 +55,37 @@ impl Bridge {
 }
 
 pub fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("", "", "codex-usage-widget")
+    ProjectDirs::from("", "", "recast-widget")
+}
+
+/// Settings and icons saved under the previous name, Codex Usage Widget, carry over once.
+fn migrate_previous_name() {
+    let (Some(current), Some(previous)) = (
+        project_dirs(),
+        ProjectDirs::from("", "", "codex-usage-widget"),
+    ) else {
+        return;
+    };
+    if current.config_dir().join("settings.json").exists()
+        || !previous.config_dir().join("settings.json").exists()
+    {
+        return;
+    }
+    let _ = copy_folder(previous.config_dir(), current.config_dir());
+}
+
+fn copy_folder(source: &Path, target: &Path) -> io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let destination = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_folder(&entry.path(), &destination)?;
+        } else {
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
 }
 
 /// Service icons the user provides, such as `claude.png`; the app does not bundle any logos.
@@ -71,6 +101,7 @@ impl Settings {
     }
 
     pub fn load() -> Self {
+        migrate_previous_name();
         let Ok(bytes) = Self::path().and_then(fs::read) else {
             return Self {
                 first_run: true,
@@ -158,6 +189,27 @@ mod tests {
         let round_trip: Settings =
             serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
         assert_eq!(round_trip.bridges, saved.bridges);
+    }
+
+    #[test]
+    fn folders_from_the_previous_name_are_copied_with_their_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "widget-migration-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous = root.join("previous");
+        fs::create_dir_all(previous.join("icons")).unwrap();
+        fs::write(previous.join("settings.json"), b"{}").unwrap();
+        fs::write(previous.join("icons/claude.png"), b"png").unwrap();
+        let current = root.join("current");
+        copy_folder(&previous, &current).unwrap();
+        assert_eq!(fs::read(current.join("settings.json")).unwrap(), b"{}");
+        assert_eq!(fs::read(current.join("icons/claude.png")).unwrap(), b"png");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

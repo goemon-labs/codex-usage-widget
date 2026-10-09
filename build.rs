@@ -4,8 +4,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
             .set_icon("assets/icon.ico")
-            .set("ProductName", "Codex Usage Widget")
-            .set("FileDescription", "Codex Usage Widget")
+            .set("ProductName", "ReCast")
+            .set("FileDescription", "ReCast")
             .compile()
             .expect("compile Windows icon and version information");
     }

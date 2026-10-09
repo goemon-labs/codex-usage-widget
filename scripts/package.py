@@ -13,7 +13,7 @@ import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-APP = "Codex Usage Widget"
+APP = "ReCast"
 TARGETS = {
     "x86_64-pc-windows-msvc": "windows-x64",
     "aarch64-apple-darwin": "macos-arm64",
@@ -86,13 +86,13 @@ def main():
     if args.build:
         build_release(args.target)
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-    executable = "codex-usage-widget" + (".exe" if windows else "")
+    executable = "recast-widget" + (".exe" if windows else "")
     binary = (args.binary or ROOT / "target" / args.target / "release" / executable).resolve()
     if not binary.is_file():
         parser.error(f"Build the release binary first: {binary}")
     dist = (ROOT / "dist").resolve()
     dist.mkdir(exist_ok=True)
-    archive = dist / f"codex-usage-widget-{version}-{TARGETS[args.target]}.zip"
+    archive = dist / f"recast-widget-{version}-{TARGETS[args.target]}.zip"
     outputs = [archive]
     with tempfile.TemporaryDirectory(prefix="package-", dir=dist) as temporary:
         staging = Path(temporary).resolve()
@@ -114,7 +114,7 @@ def main():
                 plistlib.dump({
                     "CFBundleName": APP,
                     "CFBundleDisplayName": APP,
-                    "CFBundleIdentifier": "io.github.codex-usage-widget",
+                    "CFBundleIdentifier": "io.github.goemon-labs.recast-widget",
                     "CFBundleExecutable": executable,
                     "CFBundleIconFile": "icon.icns",
                     "CFBundlePackageType": "APPL",
@@ -140,7 +140,7 @@ def main():
                     f"/DProjectDir={ROOT}", f"/DPayloadDir={payload}", f"/DInstallerOutputDir={dist}",
                     str(ROOT / "scripts/windows-installer.iss"),
                 ], check=True)
-                outputs.append(dist / f"codex-usage-widget-{version}-windows-x64-setup.exe")
+                outputs.append(dist / f"recast-widget-{version}-windows-x64-setup.exe")
         else:
             signing = ["codesign", "--force", "--sign", args.sign_identity or "-"]
             if args.sign_identity:

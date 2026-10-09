@@ -78,10 +78,11 @@ fn main() -> eframe::Result {
     else {
         return Ok(());
     };
+    platform::migrate_auto_launch();
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("bundled icon is valid");
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Codex Usage Widget")
+        .with_title("ReCast")
         .with_inner_size(app::window_size(settings.bar_mode))
         .with_decorations(false)
         .with_has_shadow(false)
@@ -116,7 +117,7 @@ fn main() -> eframe::Result {
     // Waiting for the monitor refresh blocks window dragging on some Windows drivers.
     options.glow_options.vsync = false;
     eframe::run_native(
-        "Codex Usage Widget",
+        "ReCast",
         options,
         Box::new(move |cc| {
             platform::configure_window(cc);

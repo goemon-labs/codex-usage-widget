@@ -120,7 +120,7 @@ mod os {
 
     pub fn acquire(_directory: &Path, id: u64) -> io::Result<(bool, Guard, Signal)> {
         let name = |suffix| {
-            format!("Local\\codex-usage-widget-{id:016x}-{suffix}\0")
+            format!("Local\\recast-widget-{id:016x}-{suffix}\0")
                 .encode_utf16()
                 .collect::<Vec<_>>()
         };
@@ -135,7 +135,7 @@ mod os {
     }
 
     pub fn allow_activation() {
-        let title: Vec<u16> = "Codex Usage Widget\0".encode_utf16().collect();
+        let title: Vec<u16> = "ReCast\0".encode_utf16().collect();
         // Only grant foreground permission to the existing widget's window.
         unsafe {
             let window = FindWindowW(ptr::null(), title.as_ptr());
@@ -203,7 +203,7 @@ mod os {
             Err(TryLockError::Error(error)) => return Err(error),
         };
         // macOS supplies a per-user temporary directory; keep the socket pathname short.
-        let path = std::env::temp_dir().join(format!("cuw-{id:016x}.sock"));
+        let path = std::env::temp_dir().join(format!("recast-{id:016x}.sock"));
         let socket = if primary {
             // Holding the file lock proves any endpoint left by our previous run is stale.
             match fs::remove_file(&path) {

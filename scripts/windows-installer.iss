@@ -1,11 +1,11 @@
-#define AppName "Codex Usage Widget"
-#define AppExecutable "codex-usage-widget.exe"
+#define AppName "ReCast"
+#define AppExecutable "recast-widget.exe"
 
 [Setup]
 AppId=io.github.codex-usage-widget
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=Codex Usage Widget contributors
+AppPublisher=ReCast contributors
 DefaultDirName={localappdata}\Programs\{#AppName}
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -15,7 +15,7 @@ DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExecutable}
 SetupIconFile={#ProjectDir}\assets\icon.ico
 OutputDir={#InstallerOutputDir}
-OutputBaseFilename=codex-usage-widget-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=recast-widget-{#AppVersion}-windows-x64-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -40,6 +40,12 @@ Source: "{#PayloadDir}\THIRD-PARTY-LICENSES.md"; DestDir: "{app}"; Flags: ignore
 Source: "{#PayloadDir}\assets\FONT-LICENSE.txt"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "{#PayloadDir}\assets\NOTICE.md"; DestDir: "{app}\assets"; Flags: ignoreversion
 
+[InstallDelete]
+; Files left by the Codex Usage Widget versions when updating over them.
+Type: files; Name: "{app}\codex-usage-widget.exe"
+Type: files; Name: "{userprograms}\Codex Usage Widget.lnk"
+Type: files; Name: "{userdesktop}\Codex Usage Widget.lnk"
+
 [Icons]
 Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExecutable}"; WorkingDir: "{app}"
 Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExecutable}"; WorkingDir: "{app}"; Tasks: desktopicon
@@ -49,21 +55,28 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExecutable}"; WorkingDir
 ; official Codex CLI's user-created junction with Windows error 448.
 
 [Code]
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+procedure RemoveRunEntry(const Name, Executable: String);
 var
-  Command, Executable: String;
+  Command: String;
+begin
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', Name, Command) then
+  begin
+    Command := Trim(Command);
+    if (CompareText(Command, Executable) = 0) or
+       (CompareText(Command, '"' + Executable + '"') = 0) then
+    begin
+      RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', Name);
+      RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', Name);
+    end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
-    if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
-      '{#AppName}', Command) then
-    begin
-      Command := Trim(Command);
-      Executable := ExpandConstant('{app}\{#AppExecutable}');
-      if (CompareText(Command, Executable) = 0) or
-         (CompareText(Command, '"' + Executable + '"') = 0) then
-      begin
-        RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#AppName}');
-        RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', '{#AppName}');
-      end;
-    end;
+  begin
+    RemoveRunEntry('{#AppName}', ExpandConstant('{app}\{#AppExecutable}'));
+    // A login item left by the Codex Usage Widget versions if ReCast never started.
+    RemoveRunEntry('Codex Usage Widget', ExpandConstant('{app}\codex-usage-widget.exe'));
+  end;
 end;

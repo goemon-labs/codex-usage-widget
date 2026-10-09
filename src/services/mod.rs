@@ -25,7 +25,7 @@ impl ServiceId {
     pub fn name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
-            Self::ClaudeCode => "Claude Code",
+            Self::ClaudeCode => "Claude Code（CLI）",
             Self::AntigravityCli => "Antigravity CLI",
         }
     }

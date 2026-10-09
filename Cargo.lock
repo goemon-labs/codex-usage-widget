@@ -276,24 +276,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-usage-widget"
-version = "0.1.0"
-dependencies = [
- "auto-launch",
- "chrono",
- "directories",
- "eframe",
- "libc",
- "rfd",
- "serde",
- "serde_json",
- "tray-icon",
- "windows-sys 0.61.2",
- "winit",
- "winresource",
-]
-
-[[package]]
 name = "color"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1925,6 +1907,24 @@ dependencies = [
  "bytemuck",
  "font-types",
  "once_cell",
+]
+
+[[package]]
+name = "recast-widget"
+version = "0.1.0"
+dependencies = [
+ "auto-launch",
+ "chrono",
+ "directories",
+ "eframe",
+ "libc",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tray-icon",
+ "windows-sys 0.61.2",
+ "winit",
+ "winresource",
 ]
 
 [[package]]

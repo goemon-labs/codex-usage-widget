@@ -240,7 +240,7 @@ pub fn fetch(
         send(
             &mut stdin,
             json!({"id": 1, "method": "initialize", "params": {
-                "clientInfo": {"name": "codex_usage_widget", "title": "Codex Usage Widget", "version": env!("CARGO_PKG_VERSION")}
+                "clientInfo": {"name": "recast_widget", "title": "ReCast", "version": env!("CARGO_PKG_VERSION")}
             }}),
         )?;
         receive(&rx, 1, deadline, cancel)?;
