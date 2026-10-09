@@ -718,30 +718,26 @@ impl Widget {
     fn combined_ui(&mut self, ui: &mut egui::Ui) {
         let now = Local::now().timestamp();
         let services = self.settings.services.clone();
-        let sections: Vec<_> = services
-            .iter()
-            .map(|&service| {
-                let source = self.source(service);
-                match self.snapshot(service) {
-                    Some(snapshot) => (
-                        service,
-                        card::rows(snapshot, source.received, now),
-                        "利用枠の情報を取得できませんでした".to_string(),
-                    ),
-                    None => (service, Vec::new(), card::hero(None, &source, now).when),
-                }
-            })
-            .collect();
-        let value_width = card::value_width(ui, sections.iter().flat_map(|(_, rows, _)| rows));
-        for (index, (service, rows, empty)) in sections.into_iter().enumerate() {
-            ui.add_space(if index == 0 { 14.0 } else { 16.0 });
+        for (index, &service) in services.iter().enumerate() {
+            ui.add_space(if index == 0 { 14.0 } else { 22.0 });
             self.section_header(ui, service);
-            for row in &rows {
-                card::row_ui(ui, row, value_width);
-                ui.add_space(4.0);
-            }
-            if rows.is_empty() {
-                ui.label(RichText::new(empty).size(12.0).color(MUTED));
+            let source = self.source(service);
+            match self.snapshot(service) {
+                Some(snapshot) => {
+                    let blocks = card::blocks(snapshot, &source, now);
+                    if blocks.is_empty() {
+                        ui.label(
+                            RichText::new("利用枠の情報を取得できませんでした")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
+                    card::stack_ui(ui, &blocks, 6.0);
+                }
+                None => {
+                    let waiting = card::hero(None, &source, now).when;
+                    ui.label(RichText::new(waiting).size(12.0).color(MUTED));
+                }
             }
             if service == ServiceId::Codex
                 && let Some(error) = &self.error
@@ -846,10 +842,18 @@ impl Widget {
         let now = Local::now().timestamp();
         let source = self.source(service);
         let snapshot = self.snapshot(service);
-        let hero = card::hero(snapshot, &source, now);
-        let lines =
-            snapshot.map_or_else(Vec::new, |usage| card::lines(usage, source.received, now));
-        card::hero_ui(ui, &hero);
+        // Model families with their own limits, such as Gemini and Claude・GPT, get equal size.
+        let (blocks, lines) = match snapshot {
+            Some(usage) if card::has_families(usage) => (
+                card::blocks(usage, &source, now),
+                card::money_lines(usage, true),
+            ),
+            _ => (
+                vec![card::hero(snapshot, &source, now)],
+                snapshot.map_or_else(Vec::new, |usage| card::lines(usage, source.received, now)),
+            ),
+        };
+        card::stack_ui(ui, &blocks, 17.0);
         // Only some plans earn reset credits; keep the row in place until the first response.
         if service == ServiceId::Codex
             && self
@@ -1858,13 +1862,19 @@ mod tests {
             "利用状況",
             "Codex",
             "Claude Code",
-            "5時間",
-            "週次",
-            "0%",
+            "5時間の残り",
+            "週次の残り",
             "62%",
+            "リキャスト中（5時間の枠）",
         ] {
             assert!(has(&combined, wanted), "{wanted}");
         }
+        // Each window is laid out as on the single card, so the reset caption repeats.
+        let resets = combined
+            .iter()
+            .filter(|(text, _)| text == "リセット")
+            .count();
+        assert_eq!(resets, 3);
         assert_eq!(widget.size.x, WIDTH);
         let section = combined
             .iter()

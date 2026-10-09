@@ -1,7 +1,6 @@
 //! What one service's usage looks like, shared by the single card and the combined view.
 use super::{AMBER, BORDER, FOREGROUND, GREEN, MUTED, reset_label};
 use crate::quota::{self, Blocked, Cap, Group, Snapshot, Window};
-use chrono::{Local, TimeZone};
 use eframe::egui::{self, Align, Layout, RichText, Sense, vec2};
 
 /// How a service's numbers arrive, which changes how missing or stale data is described.
@@ -13,7 +12,7 @@ pub(super) struct Source {
     pub loading: bool,
 }
 
-/// The large figure at the top of a card.
+/// A large figure: what is left of a limit, or a countdown while it recovers.
 #[derive(Debug, PartialEq)]
 pub(super) struct Hero {
     pub label: String,
@@ -27,18 +26,13 @@ pub(super) struct Hero {
     pub when: String,
 }
 
-/// A limit listed below the large figure, or as one row of the combined view.
+/// A limit listed below the large figure.
 #[derive(Debug, PartialEq)]
 pub(super) struct Line {
     pub title: String,
-    /// The title without "の残り", for the narrow rows of the combined view.
-    pub label: String,
     pub value: String,
-    pub short_value: String,
     pub fraction: Option<f32>,
     pub note: Option<String>,
-    /// The reset line of a combined-view row, such as "リセット：13:43".
-    pub when: Option<String>,
     pub alert: bool,
 }
 
@@ -150,6 +144,50 @@ fn blocked_hero(blocked: &Blocked, now: i64) -> Hero {
     }
 }
 
+/// Every window as its own large figure, for the combined view and for services whose
+/// model families each have their own limits.
+pub(super) fn blocks(snapshot: &Snapshot, source: &Source, now: i64) -> Vec<Hero> {
+    let mut blocks: Vec<Hero> = snapshot
+        .groups
+        .iter()
+        .flat_map(|group| group.windows.iter().map(move |window| (group, window)))
+        .map(|(group, window)| {
+            if window.exhausted(now) {
+                let blocked = Blocked {
+                    label: format!("{}の枠", group.window_label(window)),
+                    until: window.resets_at,
+                    minutes: window.span.minutes(),
+                };
+                blocked_hero(&blocked, now)
+            } else {
+                window_hero(group, window, source, now)
+            }
+        })
+        .collect();
+    if blocks.is_empty()
+        && let Some(cap) = &snapshot.cap
+    {
+        blocks.push(cap_hero(cap));
+    }
+    // A stop that no window explains, such as a spending cap, comes first.
+    if let Some(blocked) = active_block(snapshot, source.received, now)
+        && !blocks.iter().any(|block| block.blocked)
+    {
+        blocks.insert(0, blocked_hero(blocked, now));
+    }
+    blocks
+}
+
+/// Whether a service reports separate limits for more than one model family.
+pub(super) fn has_families(snapshot: &Snapshot) -> bool {
+    snapshot
+        .groups
+        .iter()
+        .filter(|group| !group.windows.is_empty())
+        .count()
+        > 1
+}
+
 /// Every limit not already shown as the large figure.
 pub(super) fn lines(snapshot: &Snapshot, received: bool, now: i64) -> Vec<Line> {
     let main = snapshot
@@ -164,115 +202,68 @@ pub(super) fn lines(snapshot: &Snapshot, received: bool, now: i64) -> Vec<Line> 
             .find(|window| window.exhausted(now) && window.resets_at == blocked.until),
         None => snapshot.main_window(),
     };
-    let mut lines = window_lines(snapshot, received, now, hero_window);
-    let cap_is_hero = block.is_none() && snapshot.main_window().is_none();
-    if let Some(cap) = snapshot.cap.as_ref().filter(|_| !cap_is_hero) {
-        lines.push(cap_line(cap, now));
-    }
-    if let Some(balance) = &snapshot.balance {
-        lines.push(Line {
-            title: "クレジット残高".into(),
-            label: "クレジット残高".into(),
-            value: balance.clone(),
-            short_value: balance.clone(),
-            fraction: None,
-            note: None,
-            when: None,
-            alert: false,
-        });
-    }
-    lines
-}
-
-/// What the combined view lists for a service: its time windows, or its spending cap.
-pub(super) fn rows(snapshot: &Snapshot, received: bool, now: i64) -> Vec<Line> {
-    let mut rows = window_lines(snapshot, received, now, None);
-    if rows.is_empty()
-        && let Some(cap) = &snapshot.cap
-    {
-        rows.push(cap_line(cap, now));
-    }
-    rows
-}
-
-fn window_lines(snapshot: &Snapshot, received: bool, now: i64, skip: Option<&Window>) -> Vec<Line> {
-    snapshot
+    let mut lines: Vec<Line> = snapshot
         .groups
         .iter()
         .flat_map(|group| group.windows.iter().map(move |window| (group, window)))
-        .filter(|(_, window)| !skip.is_some_and(|skip| std::ptr::eq(skip, *window)))
+        .filter(|(_, window)| !hero_window.is_some_and(|hero| std::ptr::eq(hero, *window)))
         .map(|(group, window)| window_line(group, window, received, now))
-        .collect()
+        .collect();
+    let cap_is_hero = block.is_none() && snapshot.main_window().is_none();
+    lines.extend(money_lines(snapshot, !cap_is_hero));
+    lines
 }
 
-fn cap_line(cap: &Cap, now: i64) -> Line {
-    let value = quota::percent_label(cap.remaining);
-    Line {
+/// The spending cap, unless it is already the large figure, and the prepaid balance.
+pub(super) fn money_lines(snapshot: &Snapshot, with_cap: bool) -> Vec<Line> {
+    let cap = snapshot.cap.as_ref().filter(|_| with_cap).map(|cap| Line {
         title: format!("{}の残り", cap.label),
-        label: cap.label.clone(),
-        short_value: value.clone(),
-        value,
+        value: quota::percent_label(cap.remaining),
         fraction: fraction(cap.remaining),
         note: cap.detail.clone(),
-        when: cap.resets_at.map(|reset| reset_line(reset, now)),
         alert: cap.remaining.is_some_and(|remaining| remaining <= 0.0),
-    }
+    });
+    let balance = snapshot.balance.as_ref().map(|balance| Line {
+        title: "クレジット残高".into(),
+        value: balance.clone(),
+        fraction: None,
+        note: None,
+        alert: false,
+    });
+    cap.into_iter().chain(balance).collect()
 }
 
 fn window_line(group: &Group, window: &Window, received: bool, now: i64) -> Line {
-    let label = group.window_label(window);
-    let title = format!("{label}の残り");
+    let title = format!("{}の残り", group.window_label(window));
     if window.exhausted(now) {
         return Line {
             title,
-            label,
             value: window
                 .resets_at
                 .map_or("0%".into(), |reset| countdown_label(reset, now)),
-            short_value: "0%".into(),
             fraction: None,
             note: window
                 .resets_at
                 .map(|reset| format!("{} に回復", reset_label(reset))),
-            when: window.resets_at.map(|reset| reset_line(reset, now)),
             alert: true,
         };
     }
     let expired = window.expired(now);
-    let value = match (expired, received) {
-        (true, true) => "リセット済み".into(),
-        (true, false) => "確認中".into(),
-        (false, _) => window.remaining_label(),
-    };
     Line {
         title,
-        label,
-        short_value: if expired { "—".into() } else { value.clone() },
-        value,
+        value: match (expired, received) {
+            (true, true) => "リセット済み".into(),
+            (true, false) => "確認中".into(),
+            (false, _) => window.remaining_label(),
+        },
         fraction: fraction(window.remaining).filter(|_| !expired),
         note: window.resets_at.map(reset_label),
-        when: if expired {
-            Some("リセット済み".into())
-        } else {
-            window.resets_at.map(|reset| reset_line(reset, now))
-        },
         alert: false,
     }
 }
 
 fn fraction(percent: Option<f64>) -> Option<f32> {
     percent.map(|value| (value / 100.0).clamp(0.0, 1.0) as f32)
-}
-
-/// When a row resets: the time for today, otherwise the full date.
-fn reset_line(timestamp: i64, now: i64) -> String {
-    let local = |time| Local.timestamp_opt(time, 0).single();
-    match (local(timestamp), local(now)) {
-        (Some(time), Some(today)) if time.date_naive() == today.date_naive() => {
-            format!("リセット：{}", time.format("%H:%M"))
-        }
-        _ => format!("リセット：{}", reset_label(timestamp)),
-    }
 }
 
 /// Time left until a limit recovers, rounded up so it never reads zero too early.
@@ -311,27 +302,40 @@ pub(super) fn bar_text(hero: &Hero) -> String {
     }
 }
 
-pub(super) fn hero_ui(ui: &mut egui::Ui, hero: &Hero) {
-    ui.add_space(17.0);
-    ui.label(RichText::new(&hero.label).size(11.0).color(MUTED));
-    ui.add_space(1.0);
-    // A countdown is longer than a percentage; keep it on one line inside the card.
-    let (size, color) = if hero.blocked {
-        (26.0, AMBER)
-    } else {
-        (32.0, FOREGROUND)
-    };
-    ui.label(RichText::new(&hero.value).size(size).color(color));
-    ui.add_space(7.0);
-    let fill = if hero.blocked { AMBER } else { GREEN };
-    bar_ui(ui, ui.available_width(), hero.fraction, fill);
-    if let Some(detail) = &hero.detail {
-        ui.add_space(8.0);
-        ui.label(RichText::new(detail).size(12.0));
+/// Windows that reset together share one reset line, shown after the last of them.
+fn shares_reset(block: &Hero, next: &Hero) -> bool {
+    block.caption == next.caption && block.when == next.when
+}
+
+/// Large figures one below another, each laid out as on the single card.
+pub(super) fn stack_ui(ui: &mut egui::Ui, blocks: &[Hero], first_gap: f32) {
+    for (index, block) in blocks.iter().enumerate() {
+        ui.add_space(if index == 0 { first_gap } else { 14.0 });
+        ui.label(RichText::new(&block.label).size(11.0).color(MUTED));
+        ui.add_space(1.0);
+        // A countdown is longer than a percentage; keep it on one line inside the card.
+        let (size, color) = if block.blocked {
+            (26.0, AMBER)
+        } else {
+            (32.0, FOREGROUND)
+        };
+        ui.label(RichText::new(&block.value).size(size).color(color));
+        ui.add_space(7.0);
+        let fill = if block.blocked { AMBER } else { GREEN };
+        bar_ui(ui, ui.available_width(), block.fraction, fill);
+        if let Some(detail) = &block.detail {
+            ui.add_space(8.0);
+            ui.label(RichText::new(detail).size(12.0));
+        }
+        if !blocks
+            .get(index + 1)
+            .is_some_and(|next| shares_reset(block, next))
+        {
+            ui.add_space(12.0);
+            ui.label(RichText::new(block.caption).size(11.0).color(MUTED));
+            ui.label(RichText::new(&block.when).size(12.0));
+        }
     }
-    ui.add_space(12.0);
-    ui.label(RichText::new(hero.caption).size(11.0).color(MUTED));
-    ui.label(RichText::new(&hero.when).size(12.0));
 }
 
 pub(super) fn line_ui(ui: &mut egui::Ui, line: &Line) {
@@ -344,61 +348,6 @@ pub(super) fn line_ui(ui: &mut egui::Ui, line: &Line) {
     });
     if let Some(note) = &line.note {
         ui.label(RichText::new(note).size(11.0).color(MUTED));
-    }
-}
-
-/// Size of the values in the combined view, close to the single card's large figure.
-const ROW_VALUE_SIZE: f32 = 28.0;
-
-/// The widest value among the rows, so every bar starts at the same place.
-pub(super) fn value_width<'a>(ui: &egui::Ui, lines: impl IntoIterator<Item = &'a Line>) -> f32 {
-    lines
-        .into_iter()
-        .map(|line| {
-            ui.painter()
-                .layout_no_wrap(
-                    line.short_value.clone(),
-                    egui::FontId::proportional(ROW_VALUE_SIZE),
-                    FOREGROUND,
-                )
-                .size()
-                .x
-        })
-        .fold(40.0, f32::max)
-        .ceil()
-}
-
-/// One limit of the combined view: label, value and bar on one line, then when it resets.
-pub(super) fn row_ui(ui: &mut egui::Ui, line: &Line, value_width: f32) {
-    const LABEL: f32 = 44.0;
-    const HEIGHT: f32 = 34.0;
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            vec2(LABEL, HEIGHT),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.add(
-                    egui::Label::new(RichText::new(&line.label).size(13.0).color(MUTED)).truncate(),
-                );
-            },
-        );
-        ui.allocate_ui_with_layout(
-            vec2(value_width, HEIGHT),
-            Layout::right_to_left(Align::Center),
-            |ui| {
-                let color = if line.alert { AMBER } else { FOREGROUND };
-                ui.label(
-                    RichText::new(&line.short_value)
-                        .size(ROW_VALUE_SIZE)
-                        .color(color),
-                );
-            },
-        );
-        let fill = if line.alert { AMBER } else { GREEN };
-        bar_ui(ui, ui.available_width(), line.fraction, fill);
-    });
-    if let Some(when) = &line.when {
-        ui.label(RichText::new(when).size(12.0).color(MUTED));
     }
 }
 
@@ -481,11 +430,15 @@ mod tests {
                 ("Claude・GPT・週次の残り".into(), "100%".into())
             ]
         );
-        let labels: Vec<_> = rows(&usage, false, NOW)
+        assert!(has_families(&usage));
+        let labels: Vec<_> = blocks(&usage, &CODEX, NOW)
             .into_iter()
-            .map(|line| line.label)
+            .map(|block| block.label)
             .collect();
-        assert_eq!(labels, ["5時間", "週次", "Claude・GPT・週次"]);
+        assert_eq!(
+            labels,
+            ["5時間の残り", "週次の残り", "Claude・GPT・週次の残り"]
+        );
     }
 
     #[test]
@@ -517,10 +470,11 @@ mod tests {
         let lines = lines(&usage, true, NOW);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].title, "週次の残り");
-        let rows = rows(&usage, true, NOW);
-        assert_eq!(rows[0].short_value, "0%");
-        assert!(rows[0].when.as_ref().unwrap().starts_with("リセット："));
-        assert!(rows[0].alert);
+        // Each window keeps its own figure; the exhausted one counts down.
+        let blocks = blocks(&usage, &CLAUDE, NOW);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], hero);
+        assert_eq!(blocks[1].label, "週次の残り");
         // Received numbers past their reset no longer claim usage is blocked.
         let later = super::hero(Some(&usage), &CLAUDE, until + 1);
         assert!(!later.blocked);
@@ -551,11 +505,35 @@ mod tests {
             (lines[0].title.as_str(), lines[0].value.as_str()),
             ("クレジット残高", "1250")
         );
-        let labels: Vec<_> = rows(&usage, false, NOW)
-            .into_iter()
-            .map(|line| line.label)
-            .collect();
-        assert_eq!(labels, ["月間クレジット上限"]);
+        assert_eq!(blocks(&usage, &CODEX, NOW), [hero]);
+    }
+
+    #[test]
+    fn windows_that_reset_together_share_one_reset_line() {
+        let usage = snapshot(
+            vec![
+                Group::new(Some("Gemini".into()), vec![window(10080, 100.0, Some(NOW))]),
+                Group::new(
+                    Some("Claude・GPT".into()),
+                    vec![window(10080, 100.0, Some(NOW))],
+                ),
+            ],
+            None,
+        );
+        let blocks = blocks(&usage, &CLAUDE, NOW - 60);
+        assert!(shares_reset(&blocks[0], &blocks[1]));
+        let apart = snapshot(
+            vec![Group::new(
+                None,
+                vec![
+                    window(300, 50.0, Some(NOW)),
+                    window(10080, 50.0, Some(NOW + 60)),
+                ],
+            )],
+            None,
+        );
+        let blocks = super::blocks(&apart, &CODEX, NOW - 60);
+        assert!(!shares_reset(&blocks[0], &blocks[1]));
     }
 
     #[test]
@@ -580,11 +558,7 @@ mod tests {
         );
         assert_eq!(lines(&expired, false, NOW)[0].value, "確認中");
         assert_eq!(lines(&expired, true, NOW)[0].value, "リセット済み");
-        let row = &rows(&expired, true, NOW)[0];
-        assert_eq!(
-            (row.short_value.as_str(), row.when.as_deref()),
-            ("—", Some("リセット済み"))
-        );
+        assert_eq!(blocks(&expired, &CLAUDE, NOW)[0].value, "—");
         assert_eq!(hero(None, &CLAUDE, NOW).when, "まだ受信していません");
         assert_eq!(hero(None, &CODEX, NOW).when, "Codexの利用枠を確認します");
         let loading = Source {
