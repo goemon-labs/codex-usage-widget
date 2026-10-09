@@ -19,7 +19,7 @@ pub struct Instance {
 
 impl Instance {
     pub fn acquire() -> io::Result<Option<Self>> {
-        let dirs = directories::ProjectDirs::from("", "", "codex-usage-widget")
+        let dirs = crate::settings::project_dirs()
             .ok_or_else(|| io::Error::other("アプリの保存先を取得できませんでした"))?;
         Self::acquire_at(dirs.data_local_dir())
     }

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod bridge;
 mod instance;
 mod platform;
 mod process;
@@ -13,6 +14,11 @@ use services::codex;
 use std::sync::{Arc, atomic::AtomicBool};
 
 fn main() -> eframe::Result {
+    let mut arguments = std::env::args().skip(1);
+    // Tools run this with their session data while in use; it must finish quickly.
+    if arguments.next().as_deref() == Some("statusline") {
+        std::process::exit(bridge::run(&arguments.next().unwrap_or_default()));
+    }
     let settings = settings::Settings::load();
     let check_app = std::env::args().any(|argument| argument == "--check-app");
     if check_app || std::env::args().any(|argument| argument == "--check") {

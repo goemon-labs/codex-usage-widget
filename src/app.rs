@@ -1,24 +1,30 @@
 mod card;
 
 use crate::{
+    bridge,
     platform::{self, Action},
     quota::Snapshot,
-    services::codex::{self, Account, ErrorKind, FetchError},
+    services::{
+        self, ServiceId,
+        codex::{self, Account, ErrorKind, FetchError},
+    },
     settings::Settings,
 };
-use chrono::{Datelike, Local, TimeZone};
+use chrono::{DateTime, Datelike, Local, TimeZone};
 use eframe::egui::{
     self, Align, Color32, FontData, FontDefinitions, FontFamily, Layout, RichText, Sense, Stroke,
     ViewportCommand, vec2,
 };
 use std::{
+    collections::BTreeMap,
+    fs,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const WIDTH: f32 = 252.0;
@@ -26,6 +32,7 @@ pub const HEIGHT: f32 = 320.0;
 const BAR_WIDTH: f32 = 212.0;
 const BAR_HEIGHT: f32 = 40.0;
 const MENU_SPACE: f32 = 208.0;
+const SETTINGS_HEIGHT: f32 = 440.0;
 const BACKGROUND: Color32 = Color32::from_rgb(20, 24, 29);
 const FOREGROUND: Color32 = Color32::from_rgb(233, 239, 242);
 const MUTED: Color32 = Color32::from_rgb(145, 157, 168);
@@ -45,11 +52,65 @@ enum FetchEvent {
     Detected(Option<codex::Installation>),
     Account(Account),
     Finished(Result<Snapshot, FetchError>),
+    Received(ServiceId, Snapshot),
 }
 
 struct Worker {
     cancel: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+}
+
+/// Picks up usage that tools store while they run, without waking the window.
+struct Watcher {
+    services: Vec<ServiceId>,
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl Watcher {
+    fn start(services: Vec<ServiceId>, sender: Sender<FetchEvent>, context: egui::Context) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let watched = services.clone();
+        let handle = thread::spawn(move || {
+            let mut seen: BTreeMap<ServiceId, Option<SystemTime>> = BTreeMap::new();
+            while !flag.load(Ordering::Relaxed) {
+                for &service in &watched {
+                    let Some(path) = bridge::received_path(service) else {
+                        continue;
+                    };
+                    let modified = fs::metadata(&path).and_then(|data| data.modified()).ok();
+                    if seen.insert(service, modified) == Some(modified) {
+                        continue;
+                    }
+                    let now = Local::now();
+                    if let Some((received_at, data)) = bridge::read(&path)
+                        && let Some(snapshot) = services::received_snapshot(
+                            service,
+                            &data,
+                            Local.timestamp_opt(received_at, 0).single().unwrap_or(now),
+                            now.timestamp(),
+                        )
+                    {
+                        let _ = sender.send(FetchEvent::Received(service, snapshot));
+                        context.request_repaint();
+                    }
+                }
+                thread::park_timeout(Duration::from_secs(3));
+            }
+        });
+        Self {
+            services,
+            stop,
+            handle,
+        }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.thread().unpark();
+        let _ = self.handle.join();
+    }
 }
 
 struct BarMenu {
@@ -63,11 +124,18 @@ pub struct Widget {
     topmost: Option<platform::topmost::Topmost>,
     instance: Option<crate::instance::Instance>,
     installation: Option<codex::Installation>,
+    /// Codex usage from the latest fetch.
     usage: Option<Snapshot>,
+    /// Usage that other tools reported while running.
+    received: BTreeMap<ServiceId, Snapshot>,
     account: Option<Account>,
     error: Option<FetchError>,
     notice: Option<String>,
     worker: Option<Worker>,
+    watcher: Option<Watcher>,
+    /// A status line registration waiting for the user to confirm it.
+    confirm_link: Option<ServiceId>,
+    started: bool,
     fetch_tx: Sender<FetchEvent>,
     fetch_rx: Receiver<FetchEvent>,
     action_tx: Sender<Action>,
@@ -133,10 +201,14 @@ impl Widget {
             instance: None,
             installation: None,
             usage: None,
+            received: BTreeMap::new(),
             account: None,
             error: None,
             notice: None,
             worker: None,
+            watcher: None,
+            confirm_link: None,
+            started: false,
             fetch_tx,
             fetch_rx,
             action_tx,
@@ -178,8 +250,64 @@ impl Widget {
         self.topmost = platform::topmost::Topmost::new(window, self.settings.always_on_top);
     }
 
+    fn shows(&self, service: ServiceId) -> bool {
+        self.settings.services.contains(&service)
+    }
+
+    fn snapshot(&self, service: ServiceId) -> Option<&Snapshot> {
+        match service {
+            ServiceId::Codex => self.usage.as_ref(),
+            _ => self.received.get(&service),
+        }
+    }
+
+    fn source(&self, service: ServiceId) -> card::Source {
+        card::Source {
+            name: service.name(),
+            received: service.received(),
+            loading: service == ServiceId::Codex && self.worker.is_some() && self.usage.is_none(),
+        }
+    }
+
+    fn update_tray(&self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        let now = Local::now().timestamp();
+        let text: Vec<_> = self
+            .settings
+            .services
+            .iter()
+            .map(|&service| {
+                let hero = card::hero(self.snapshot(service), &self.source(service), now);
+                format!("{} · {}", service.name(), card::bar_text(&hero))
+            })
+            .collect();
+        let _ = tray.set_tooltip(Some(text.join("\n")));
+    }
+
+    /// Watch exactly the selected services that report usage on their own.
+    fn sync_watcher(&mut self, ctx: &egui::Context) {
+        let wanted: Vec<_> = self
+            .settings
+            .services
+            .iter()
+            .copied()
+            .filter(|service| service.received())
+            .collect();
+        if self.watcher.as_ref().map(|watcher| &watcher.services) == Some(&wanted) {
+            return;
+        }
+        if let Some(watcher) = self.watcher.take() {
+            watcher.stop();
+        }
+        if !wanted.is_empty() {
+            self.watcher = Some(Watcher::start(wanted, self.fetch_tx.clone(), ctx.clone()));
+        }
+    }
+
     fn refresh(&mut self, ctx: &egui::Context, changed_configuration: bool) {
-        if self.worker.is_some() {
+        if self.worker.is_some() || !self.shows(ServiceId::Codex) {
             return;
         }
         if !changed_configuration && let Some(started) = self.last_started {
@@ -243,11 +371,7 @@ impl Widget {
                                     .map_or(now + 300, |reset| reset.min(now + 300)),
                             );
                             self.usage = Some(usage);
-                            if let Some(tray) = &self.tray {
-                                let hero = card::hero(self.usage.as_ref(), &self.source(), now);
-                                let text = card::bar_text(&hero);
-                                let _ = tray.set_tooltip(Some(format!("Codex · {text}")));
-                            }
+                            self.update_tray();
                         }
                         Err(error) => {
                             self.failures = self.failures.saturating_add(1);
@@ -262,6 +386,10 @@ impl Widget {
                             self.error = Some(error);
                         }
                     }
+                }
+                FetchEvent::Received(service, snapshot) => {
+                    self.received.insert(service, snapshot);
+                    self.update_tray();
                 }
             }
         }
@@ -413,23 +541,22 @@ impl Widget {
         self.menu_open = open;
     }
 
-    fn source(&self) -> card::Source {
-        card::Source {
-            name: "Codex",
-            received: false,
-            loading: self.worker.is_some() && self.usage.is_none(),
-        }
+    /// The service shown on its own when only one is selected.
+    fn primary(&self) -> ServiceId {
+        self.settings.services[0]
     }
 
     fn header(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let service = self.primary();
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(7.0, 24.0), Sense::hover());
             let hero = card::hero(
-                self.usage.as_ref(),
-                &self.source(),
+                self.snapshot(service),
+                &self.source(service),
                 Local::now().timestamp(),
             );
-            let dot = if hero.blocked || (compact && self.error.is_some()) {
+            let failed = service == ServiceId::Codex && self.error.is_some();
+            let dot = if hero.blocked || (compact && failed) {
                 AMBER
             } else if compact && hero.fraction.is_none() {
                 MUTED
@@ -440,7 +567,7 @@ impl Widget {
             if compact {
                 ui.label(RichText::new(card::bar_text(&hero)).size(13.0));
             } else {
-                ui.label(RichText::new("Codex").size(14.0).strong());
+                ui.label(RichText::new(service.name()).size(14.0).strong());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.scope(|ui| {
@@ -452,27 +579,31 @@ impl Widget {
         });
     }
 
-    fn usage_ui(&mut self, ui: &mut egui::Ui) {
+    fn usage_ui(&mut self, ui: &mut egui::Ui, service: ServiceId) {
         let now = Local::now().timestamp();
-        card::hero_ui(ui, &card::hero(self.usage.as_ref(), &self.source(), now));
+        let source = self.source(service);
+        let snapshot = self.snapshot(service);
+        let hero = card::hero(snapshot, &source, now);
+        let lines =
+            snapshot.map_or_else(Vec::new, |usage| card::lines(usage, source.received, now));
+        card::hero_ui(ui, &hero);
         // Only some plans earn reset credits; keep the row in place until the first response.
-        if self
-            .usage
-            .as_ref()
-            .is_none_or(|usage| usage.reset_credits.is_some())
+        if service == ServiceId::Codex
+            && self
+                .usage
+                .as_ref()
+                .is_none_or(|usage| usage.reset_credits.is_some())
         {
             ui.add_space(21.0);
             self.reset_credits_ui(ui, now);
         }
-        let lines = self
-            .usage
-            .as_ref()
-            .map_or_else(Vec::new, |usage| card::lines(usage, false, now));
         for (index, line) in lines.iter().enumerate() {
             ui.add_space(if index == 0 { 18.0 } else { 12.0 });
             card::line_ui(ui, line);
         }
-        if let Some(error) = &self.error {
+        if service == ServiceId::Codex
+            && let Some(error) = &self.error
+        {
             ui.add_space(15.0);
             ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
             if matches!(error.kind, ErrorKind::Setup | ErrorKind::Login)
@@ -480,12 +611,25 @@ impl Widget {
             {
                 self.settings_open = true;
             }
+        } else if service.received() && !self.settings.bridges.contains_key(&service) {
+            ui.add_space(15.0);
+            ui.label(
+                RichText::new(format!(
+                    "{}と連携すると、使っている間に残量が届きます。",
+                    service.name()
+                ))
+                .size(11.0)
+                .color(MUTED),
+            );
+            if ui.small_button("設定を開く").clicked() {
+                self.settings_open = true;
+            }
         }
 
         // Keep the footer in the content flow so expanded details cannot overlap it.
         let used_height = ui.cursor().top() - ui.min_rect().top();
         ui.add_space((HEIGHT - 42.0 - used_height - 24.0).max(22.0));
-        self.footer_ui(ui);
+        self.footer_ui(ui, service);
     }
 
     fn reset_credits_ui(&mut self, ui: &mut egui::Ui, now: i64) {
@@ -608,15 +752,24 @@ impl Widget {
         }
     }
 
-    fn footer_ui(&mut self, ui: &mut egui::Ui) {
-        let fetched = self.usage.as_ref().map(|usage| {
-            let format = if usage.observed_at.date_naive() == Local::now().date_naive() {
-                "%H:%M"
-            } else {
-                "%-m/%-d %H:%M"
+    fn footer_ui(&mut self, ui: &mut egui::Ui, service: ServiceId) {
+        // Received usage cannot be requested; say when it arrived and what updates it.
+        if service.received() {
+            let status = match self.snapshot(service) {
+                Some(snapshot) => format!(
+                    "受信 {}（{}の利用時に更新）",
+                    time_label(snapshot.observed_at),
+                    service.name()
+                ),
+                None => format!("{}の利用時に更新", service.name()),
             };
-            usage.observed_at.format(format).to_string()
-        });
+            ui.label(RichText::new(status).size(10.0).color(MUTED));
+            return;
+        }
+        let fetched = self
+            .usage
+            .as_ref()
+            .map(|usage| time_label(usage.observed_at));
         let status = if self.worker.is_some() {
             "更新中…".into()
         } else if let Some(time) = fetched {
@@ -684,6 +837,192 @@ impl Widget {
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(17.0);
+        egui::ScrollArea::vertical()
+            .id_salt("settings")
+            .max_height(SETTINGS_HEIGHT)
+            .auto_shrink([false, true])
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            })
+            .show(ui, |ui| {
+                self.services_settings_ui(ui);
+                for service in self.settings.services.clone() {
+                    ui.add_space(16.0);
+                    match service {
+                        ServiceId::Codex => self.codex_settings_ui(ui),
+                        _ => self.bridge_settings_ui(ui, service),
+                    }
+                }
+                if let Some(notice) = &self.notice {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(notice).size(11.0).color(MUTED));
+                }
+                ui.add_space(18.0);
+                ui.label(
+                    RichText::new(format!("Codex Usage Widget  {}", env!("CARGO_PKG_VERSION")))
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            });
+    }
+
+    fn services_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("表示するサービス").strong());
+        for service in ServiceId::ALL {
+            let mut shown = self.shows(service);
+            // At least one service stays selected.
+            let locked = shown && self.settings.services.len() == 1;
+            if ui
+                .add_enabled(!locked, egui::Checkbox::new(&mut shown, service.name()))
+                .changed()
+            {
+                if shown {
+                    self.settings.services.push(service);
+                } else {
+                    self.settings
+                        .services
+                        .retain(|selected| *selected != service);
+                }
+                self.services_changed(ui.ctx());
+            }
+        }
+        ui.label(
+            RichText::new("2つ以上選ぶと、まとめて表示します。")
+                .size(11.0)
+                .color(MUTED),
+        );
+    }
+
+    fn services_changed(&mut self, ctx: &egui::Context) {
+        self.persist();
+        self.sync_watcher(ctx);
+        self.update_tray();
+        if self.usage.is_none() {
+            self.refresh(ctx, true);
+        }
+    }
+
+    fn bridge_settings_ui(&mut self, ui: &mut egui::Ui, service: ServiceId) {
+        ui.label(RichText::new(format!("{}との連携", service.name())).strong());
+        let linked = self.settings.bridges.contains_key(&service);
+        let status = match (linked, self.received.get(&service)) {
+            (true, Some(snapshot)) => format!(
+                "連携しています（受信 {}）",
+                time_label(snapshot.observed_at)
+            ),
+            (true, None) => format!(
+                "連携しています。{}でメッセージを送ると、残量が届きます。",
+                service.name()
+            ),
+            (false, _) => "連携していません".into(),
+        };
+        ui.label(RichText::new(status).size(12.0).color(MUTED));
+        let file = bridge::tool_settings(service)
+            .map_or_else(String::new, |path| path.display().to_string());
+        if self.confirm_link == Some(service) {
+            ui.label(
+                RichText::new(format!(
+                    "{}の設定ファイル（{file}）のステータスラインに、残量を受け取るコマンドを登録します。\
+                     いまのステータスラインは表示されたまま残り、解除すると元の設定に戻ります。\
+                     ステータスラインを使っていない場合は、{}の画面下部に残量が表示されます。",
+                    service.name(),
+                    service.name()
+                ))
+                .size(11.0),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("登録する").clicked() {
+                    self.link(service);
+                }
+                if ui.button("キャンセル").clicked() {
+                    self.confirm_link = None;
+                }
+            });
+        } else if linked {
+            if ui.button("連携を解除").clicked() {
+                self.unlink(service);
+            }
+        } else if ui.button("連携する").clicked() {
+            self.confirm_link = Some(service);
+        }
+        egui::CollapsingHeader::new(RichText::new("手動で設定する場合").size(11.0))
+            .id_salt(("manual", service))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{file} の statusLine に、type \"command\" と次の command を設定してください。"
+                    ))
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                if let Ok(command) = bridge::command(service) {
+                    ui.label(RichText::new(&command).size(10.0).monospace());
+                    if ui.small_button("コマンドをコピー").clicked() {
+                        ui.ctx().copy_text(command);
+                    }
+                }
+            });
+    }
+
+    fn link(&mut self, service: ServiceId) {
+        self.confirm_link = None;
+        match bridge::link(service, self.settings.bridges.get(&service)) {
+            Ok(record) => {
+                self.settings.bridges.insert(service, record);
+                self.notice = Some(format!(
+                    "{}と連携しました。次に{}を使うと、残量が届きます。",
+                    service.name(),
+                    service.name()
+                ));
+                self.persist();
+            }
+            Err(message) => self.notice = Some(message),
+        }
+    }
+
+    fn unlink(&mut self, service: ServiceId) {
+        let Some(record) = self.settings.bridges.get(&service).cloned() else {
+            return;
+        };
+        match bridge::unlink(service, &record) {
+            Ok(restored) => {
+                self.settings.bridges.remove(&service);
+                self.received.remove(&service);
+                // Numbers that can no longer be updated would only mislead.
+                if let Some(path) = bridge::received_path(service) {
+                    let _ = fs::remove_file(path);
+                }
+                self.notice = Some(if restored {
+                    "連携を解除し、元の設定に戻しました。".into()
+                } else {
+                    format!(
+                        "{}の設定はすでに変更されていたため、そのままにしました。",
+                        service.name()
+                    )
+                });
+                self.persist();
+                self.update_tray();
+            }
+            Err(message) => self.notice = Some(message),
+        }
+    }
+
+    /// Keep registrations pointing at this executable after the app moves or is renamed.
+    fn relink(&mut self) {
+        let mut changed = false;
+        for (service, record) in self.settings.bridges.clone() {
+            if let Some(updated) = bridge::relink(service, &record) {
+                self.settings.bridges.insert(service, updated);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist();
+        }
+    }
+
+    fn codex_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Codexとの接続").strong());
         ui.label(
             RichText::new(match &self.installation {
@@ -758,15 +1097,6 @@ impl Widget {
         if let Some(error) = &self.error {
             ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
         }
-        if let Some(notice) = &self.notice {
-            ui.label(RichText::new(notice).size(11.0).color(MUTED));
-        }
-        ui.add_space(18.0);
-        ui.label(
-            RichText::new(format!("Codex Usage Widget  {}", env!("CARGO_PKG_VERSION")))
-                .size(10.0)
-                .color(MUTED),
-        );
     }
 }
 
@@ -813,7 +1143,7 @@ impl Widget {
                     if self.settings_open {
                         self.settings_ui(ui);
                     } else {
-                        self.usage_ui(ui);
+                        self.usage_ui(ui, self.primary());
                     }
                 }
             });
@@ -860,6 +1190,11 @@ impl eframe::App for Widget {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.started {
+            self.started = true;
+            self.relink();
+        }
+        self.sync_watcher(ctx);
         if !self.tray_attempted {
             self.tray_attempted = true;
             match platform::create_tray(self.action_tx.clone(), ctx) {
@@ -943,6 +1278,9 @@ impl Drop for Widget {
             worker.cancel.store(true, Ordering::Relaxed);
             let _ = worker.handle.join();
         }
+        if let Some(watcher) = self.watcher.take() {
+            watcher.stop();
+        }
         self.persist();
     }
 }
@@ -962,6 +1300,16 @@ fn reset_label(timestamp: i64) -> String {
                 date.format("%H:%M")
             )
         })
+}
+
+/// A time of day, with the date when it is not today.
+fn time_label(time: DateTime<Local>) -> String {
+    let format = if time.date_naive() == Local::now().date_naive() {
+        "%H:%M"
+    } else {
+        "%-m/%-d %H:%M"
+    };
+    time.format(format).to_string()
 }
 
 fn credit_expiry_label(expires_at: Option<i64>, now: i64) -> String {
